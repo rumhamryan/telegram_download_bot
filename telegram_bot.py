@@ -14,6 +14,7 @@ import configparser
 import sys
 import math
 from typing import Optional, Dict
+import functools
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -33,8 +34,8 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(rf'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def get_configuration() -> tuple[str, str]:
-    """Reads bot token and save path from the bot_token.ini file."""
+def get_configuration() -> tuple[str, str, list[int]]:
+    """Reads bot token, save path, and allowed user IDs from the bot_token.ini file."""
     config = configparser.ConfigParser()
     config_path = 'bot_token.ini'
     if not os.path.exists(config_path):
@@ -50,7 +51,19 @@ def get_configuration() -> tuple[str, str]:
     if not save_path:
         raise ValueError(f"Download 'save_path' not found or not set in '{config_path}'. Please add it under the '[telegram]' section.")
 
-    return token, save_path
+    # --- NEW: Read and parse the list of allowed user IDs ---
+    allowed_ids_str = config.get('telegram', 'allowed_user_ids', fallback='')
+    if not allowed_ids_str:
+        print("[WARN] 'allowed_user_ids' is empty. The bot will be accessible to everyone.")
+        return token, save_path, []
+
+    try:
+        # Convert comma-separated string of IDs into a list of integers
+        allowed_ids = [int(id.strip()) for id in allowed_ids_str.split(',') if id.strip()]
+        print(f"[INFO] Bot access is restricted to the following User IDs: {allowed_ids}")
+        return token, save_path, allowed_ids
+    except ValueError:
+        raise ValueError("Invalid entry in 'allowed_user_ids'. Please provide a comma-separated list of numbers.")
 
 def parse_torrent_name(name: str) -> dict:
     """
@@ -263,6 +276,28 @@ def validate_torrent_files(ti: lt.torrent_info) -> Optional[str]: # type: ignore
 
     return None
 
+async def is_user_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Checks if the user sending the update is in the allowed list.
+    Returns True if authorized, False otherwise.
+    """
+    allowed_user_ids = context.bot_data.get('ALLOWED_USER_IDS', [])
+    
+    # If the allowlist is empty, everyone is authorized.
+    if not allowed_user_ids:
+        return True
+
+    user = update.effective_user
+    if not user or user.id not in allowed_user_ids:
+        if user:
+            print(f"[ACCESS DENIED] User {user.id} ({user.username}) attempted to use the bot.")
+        else:
+            print("[ACCESS DENIED] An update with no user was received.")
+        return False
+    
+    # User is in the list, so they are authorized.
+    return True
+
 # --- PERSISTENCE FUNCTIONS ---
 
 def save_active_downloads(file_path: str, active_downloads: Dict):
@@ -340,14 +375,20 @@ async def post_shutdown(application: Application):
 # --- BOT HANDLER FUNCTIONS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_authorized(update, context):
+        return
     if not update.message: return
     await update.message.reply_text("Hello! Send me a direct URL to a .torrent file or a magnet link to begin.")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_authorized(update, context):
+        return
     if not update.message: return
     await update.message.reply_text("Send a URL ending in .torrent or a magnet link to start a download.\nUse /cancel to stop your current download.")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_authorized(update, context):
+        return
     if not update.message: return
     chat_id = update.message.chat_id
     
@@ -373,6 +414,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_authorized(update, context):
+        return
     if not update.message or not update.message.text: return
     chat_id = update.message.chat_id
     text = update.message.text.strip()
@@ -500,6 +543,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_authorized(update, context):
+        return
     query = update.callback_query
     if not query: return
     await query.answer()
@@ -642,14 +687,11 @@ async def download_task_wrapper(download_data: Dict, application: Application):
 
 # --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
-    # You must have these imports at the top of telegram_bot.py
-    # import json
-    # from telegram.ext import Application
-    
     PERSISTENCE_FILE = 'persistence.json'
 
     try:
-        BOT_TOKEN, DOWNLOAD_SAVE_PATH = get_configuration()
+        # --- UPDATED to receive the list of allowed user IDs ---
+        BOT_TOKEN, DOWNLOAD_SAVE_PATH, ALLOWED_USER_IDS = get_configuration()
     except (FileNotFoundError, ValueError) as e:
         print(f"CRITICAL ERROR: {e}")
         sys.exit(1)
@@ -660,7 +702,6 @@ if __name__ == '__main__':
 
     print("Starting bot...")
     
-    # --- FIX: Use post_init and post_shutdown hooks ---
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -672,8 +713,11 @@ if __name__ == '__main__':
     # Initialize bot_data dictionaries
     application.bot_data["DOWNLOAD_SAVE_PATH"] = DOWNLOAD_SAVE_PATH
     application.bot_data["persistence_file"] = PERSISTENCE_FILE
+    # --- NEW: Store the list of allowed IDs in the bot's global context ---
+    application.bot_data["ALLOWED_USER_IDS"] = ALLOWED_USER_IDS
     application.bot_data.setdefault('active_downloads', {})
     
+    # Handlers are defined below (no changes needed here)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
