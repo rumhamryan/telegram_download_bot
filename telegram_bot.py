@@ -17,7 +17,6 @@ import libtorrent as lt
 from download_torrent import download_with_progress
 
 # --- CONFIGURATION & HELPERS ---
-DOWNLOAD_SAVE_PATH = "C:\\Users\\Ryan\\Desktop\\Telegram Downloads"
 
 def escape_markdown(text: str) -> str:
     """Helper function to escape telegram's special characters."""
@@ -25,19 +24,26 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(rf'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def get_bot_token() -> str:
-    """Reads the bot token from the bot_token.ini file."""
+def get_configuration() -> tuple[str, str]:
+    """Reads bot token and save path from the bot_token.ini file."""
     config = configparser.ConfigParser()
     config_path = 'bot_token.ini'
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file '{config_path}' not found. Please create it.")
     
     config.read(config_path)
-    token = config.get('telegram', 'token', fallback=None)
     
+    # Read the bot token
+    token = config.get('telegram', 'token', fallback=None)
     if not token or token == "YOUR_SECRET_TOKEN_HERE":
         raise ValueError(f"Bot token not found or not set in '{config_path}'. Please add '[telegram]' section with 'token = YOUR_TOKEN'.")
-    return token
+        
+    # Read the save path
+    save_path = config.get('telegram', 'save_path', fallback=None)
+    if not save_path:
+        raise ValueError(f"Download 'save_path' not found or not set in '{config_path}'. Please add it under the '[telegram]' section.")
+
+    return token, save_path
 
 def clean_filename(name: str) -> str:
     """
@@ -251,7 +257,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "confirm_download":
         print(f"[SUCCESS] Download confirmed by user {message.chat_id}. Queuing download task.")
         await query.edit_message_text("✅ Confirmation received. Your download has been queued.")
-        task = asyncio.create_task(download_task_wrapper(temp_torrent_path, message, context))
+        
+        # CORRECTED WAY: Retrieve the save path from bot_data dictionary.
+        download_path = context.bot_data["DOWNLOAD_SAVE_PATH"]
+        
+        task = asyncio.create_task(download_task_wrapper(temp_torrent_path, message, context, download_path))
         context.bot_data[message.chat_id] = task
 
     elif query.data == "cancel_operation":
@@ -260,7 +270,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.exists(temp_torrent_path):
             os.remove(temp_torrent_path)
 
-async def download_task_wrapper(torrent_path: str, message: Message, context: ContextTypes.DEFAULT_TYPE):
+async def download_task_wrapper(torrent_path: str, message: Message, context: ContextTypes.DEFAULT_TYPE, save_path: str):
     """A wrapper function that contains the main download logic."""
     progress_message = message
     original_filename = os.path.basename(torrent_path)
@@ -289,7 +299,7 @@ async def download_task_wrapper(torrent_path: str, message: Message, context: Co
                 print(f"[WARN] Could not edit Telegram message: {e}")
 
     try:
-        success = await download_with_progress(torrent_path, DOWNLOAD_SAVE_PATH, report_progress)
+        success = await download_with_progress(torrent_path, save_path, report_progress)
         if success:
             print(f"[SUCCESS] Download task for '{original_filename}' completed.")
             await progress_message.edit_text(r"✅ *Success\!* The download is complete\.", parse_mode=ParseMode.MARKDOWN_V2)
@@ -309,16 +319,27 @@ async def download_task_wrapper(torrent_path: str, message: Message, context: Co
 
 # --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
-    if not os.path.exists(DOWNLOAD_SAVE_PATH):
-        os.makedirs(DOWNLOAD_SAVE_PATH)
     try:
-        BOT_TOKEN = get_bot_token()
+        # Read both configuration values at once.
+        BOT_TOKEN, DOWNLOAD_SAVE_PATH = get_configuration()
     except (FileNotFoundError, ValueError) as e:
+        # The same error handling now catches issues with the token OR the save_path.
         print(f"CRITICAL ERROR: {e}")
         sys.exit(1)
 
+    # Ensure the configured download directory exists.
+    if not os.path.exists(DOWNLOAD_SAVE_PATH):
+        print(f"INFO: Download path '{DOWNLOAD_SAVE_PATH}' not found. Creating it.")
+        os.makedirs(DOWNLOAD_SAVE_PATH)
+
     print("Starting bot...")
+    
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # CORRECTED WAY: Store the save path in the bot_data dictionary.
+    # This dictionary is designed for storing global bot-related data.
+    application.bot_data["DOWNLOAD_SAVE_PATH"] = DOWNLOAD_SAVE_PATH
+    
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
