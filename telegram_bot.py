@@ -39,11 +39,82 @@ def get_bot_token() -> str:
         raise ValueError(f"Bot token not found or not set in '{config_path}'. Please add '[telegram]' section with 'token = YOUR_TOKEN'.")
     return token
 
+def clean_filename(name: str) -> str:
+    """
+    Cleans a torrent name by extracting the movie title and year,
+    and discarding all other tags and metadata.
+    """
+    # 1. Replace all dots and underscores with spaces.
+    # This makes the string easier to parse.
+    cleaned_name = re.sub(r'[\._]', ' ', name)
+
+    # 2. Find the year (a 4-digit number between 1900 and 2099).
+    # This is our primary anchor point.
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', cleaned_name)
+
+    if year_match:
+        # If a year is found, everything before it is the title.
+        year = year_match.group(1)
+        title = cleaned_name[:year_match.start()].strip()
+        
+        # 3. Further clean the title by removing any leftover junk in parentheses
+        # that isn't part of the title itself.
+        title = re.sub(r'\s*\(.*?\)\s*', '', title).strip()
+
+        # 4. Reconstruct the string in the desired "Title (Year)" format.
+        return f"{title} ({year})"
+    else:
+        # If no year is found, we do our best with a simpler cleaning method.
+        # This part handles filenames that don't follow the "Title Year" pattern.
+        # It removes content in brackets and common keywords.
+        tags_to_remove = [
+            r'\[.*?\]',  # Tags in square brackets
+            r'\(.*?\)',  # Tags in parentheses
+            r'\b(1080p|720p|480p|x264|x265|hevc|BluRay|WEB-DL|AAC|DTS|HDTV|RM4k|CC|10bit|commentary|HeVK)\b'
+        ]
+        regex_pattern = '|'.join(tags_to_remove)
+        
+        # Remove the file extension at the very end
+        no_ext = os.path.splitext(cleaned_name)[0]
+        cleaned_name = re.sub(regex_pattern, '', no_ext, flags=re.I)
+        
+        # Collapse multiple spaces into one.
+        return re.sub(r'\s+', ' ', cleaned_name).strip()
+
+def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
+    """
+    Finds the file extension of the largest file in the torrent,
+    which is likely the main content file.
+    """
+    if files.num_files() == 0:
+        return "N/A"
+
+    largest_file_index = -1
+    max_size = -1
+
+    for i in range(files.num_files()):
+        if files.file_size(i) > max_size:
+            max_size = files.file_size(i)
+            largest_file_index = i
+            
+    # Get the filename of the largest file
+    largest_filename = files.file_path(largest_file_index)
+    
+    # Extract the extension
+    _, extension = os.path.splitext(largest_filename)
+    
+    if extension:
+        return extension[1:].upper() # Return 'MP4', 'MKV', etc.
+    return "N/A"
+
 def format_bytes(size_bytes: int) -> str:
     """Formats a size in bytes into a human-readable string (KB, MB, GB, etc.)."""
-    if size_bytes == 0: return "0B"
+    if size_bytes <= 0: return "0B" # Changed to handle zero and negative
     size_name = ("B", "KB", "MB", "GB", "TB")
-    i = int(math.floor(math.log(size_bytes, 1024)))
+    try:
+        i = int(math.floor(math.log(size_bytes, 1024)))
+    except ValueError:
+        i = 0 # Handle cases where size_bytes is 0
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
@@ -79,27 +150,21 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     url = update.message.text
     
-    print(f"[INFO] Received message from chat_id {chat_id}.")
-
     if not (url.startswith(('http://', 'https://')) and url.endswith('.torrent')):
-        print(f"[INFO] Message from {chat_id} was not a valid .torrent URL.")
         await update.message.reply_text("This does not appear to be a valid .torrent URL.")
         return
         
     if chat_id in context.bot_data:
-        print(f"[WARN] User {chat_id} tried to start a new download while one is active.")
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
     progress_message = await update.message.reply_text("✅ URL received. Analyzing .torrent file...")
-    print(f"[INFO] Downloading .torrent file from URL: {url}")
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, follow_redirects=True, timeout=30)
             response.raise_for_status()
     except httpx.RequestError as e:
-        print(f"[ERROR] Failed to download .torrent from URL for chat_id {chat_id}. Reason: {e}")
         safe_error = escape_markdown(str(e))
         await progress_message.edit_text(rf"❌ *Error:* Failed to download from URL\." + f"\n`{safe_error}`", parse_mode=ParseMode.MARKDOWN_V2)
         return
@@ -108,8 +173,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_file.write(response.content)
         temp_torrent_path = temp_file.name
 
-    print(f"[SUCCESS] Downloaded and saved .torrent to temporary path: {temp_torrent_path}")
-
     try:
         ti = lt.torrent_info(temp_torrent_path)  # type: ignore
     except RuntimeError:
@@ -117,26 +180,26 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
         os.remove(temp_torrent_path)
         return
-
+    
     files = ti.files()
-    num_files = files.num_files()
+    
+    # Use our new helper functions to get cleaned-up data
+    cleaned_name_str = clean_filename(ti.name())
+    file_type_str = get_dominant_file_type(files)
+    total_size_str = format_bytes(ti.total_size())
 
-    file_list = [
-        rf"`{escape_markdown(files.file_path(i))}` \({escape_markdown(format_bytes(files.file_size(i)))}\)"
-        for i in range(num_files)
-    ]
+    # Escape all strings for safe display in Markdown
+    safe_name = escape_markdown(cleaned_name_str)
+    safe_file_type = escape_markdown(file_type_str)
+    safe_total_size = escape_markdown(total_size_str)
     
-    if len(file_list) > 10:
-        file_list = file_list[:10] + ["`...and more`"]
-    
-    total_size_str = escape_markdown(format_bytes(ti.total_size()))
-    
+    # Build the new, cleaner confirmation message
     confirmation_text = (
         f"🔎 *Torrent Details*\n\n"
-        f"*Name:* `{escape_markdown(ti.name())}`\n"
-        f"*Total Size:* {total_size_str}\n"
-        f"*Files \({num_files}\):*\n" + "\n".join(file_list) +
-        f"\n\nDo you want to start this download?"
+        f"*Name:* {safe_name}\n"
+        f"*File Type:* {safe_file_type}\n"
+        f"*Total Size:* {safe_total_size}\n\n"
+        f"Do you want to start this download?"
     )
 
     keyboard = [[
@@ -146,10 +209,10 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await progress_message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{ti.name()}'.")
+    print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{cleaned_name_str}'.")
     
     if context.user_data is None:
-        print("[ERROR] context.user_data was None for chat_id {chat_id}. This is unexpected. Aborting operation.")
+        print(f"[ERROR] context.user_data was None for chat_id {chat_id}. This is unexpected. Aborting operation.")
         await progress_message.edit_text(r"❌ *Error:* Could not access user session data\. Please try again\.", parse_mode=ParseMode.MARKDOWN_V2)
         if os.path.exists(temp_torrent_path):
             os.remove(temp_torrent_path)
