@@ -146,7 +146,6 @@ def generate_plex_filename(parsed_info: dict, original_extension: str) -> str:
     title = parsed_info.get('title', 'Unknown Title')
     
     # Sanitize title to remove characters invalid for filenames
-    # A simple approach: remove common invalid chars. For a more robust solution, a dedicated library might be used.
     invalid_chars = r'<>:"/\|?*'
     safe_title = "".join(c for c in title if c not in invalid_chars)
 
@@ -163,7 +162,8 @@ def generate_plex_filename(parsed_info: dict, original_extension: str) -> str:
         if episode_title:
             safe_episode_title = " - " + "".join(c for c in episode_title if c not in invalid_chars)
             
-        return f"{safe_title} - S{season:02d}E{episode:02d}{safe_episode_title}{original_extension}"
+        # MODIFIED: Return format is now "sXXeXX - Episode Title.ext"
+        return f"s{season:02d}e{episode:02d}{safe_episode_title}{original_extension}"
         
     else: # Fallback for 'unknown' type
         return f"{safe_title}{original_extension}"
@@ -695,15 +695,15 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     source_dict = download_data['source_dict']
     chat_id = download_data['chat_id']
     message_id = download_data['message_id']
-    save_path = download_data['save_path']
+    base_save_path = download_data['save_path']
     
     source_value = source_dict['value']
     source_type = source_dict['type']
     clean_name = source_dict.get('clean_name', "Download")
+    parsed_info = source_dict.get('parsed_info', {})
     
     print(f"[INFO] Starting/Resuming download task for '{clean_name}' for chat_id {chat_id}.")
     
-    # ... (report_progress inner function is unchanged) ...
     last_update_time = 0
     async def report_progress(status: lt.torrent_status): #type: ignore
         nonlocal last_update_time
@@ -720,7 +720,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             speed_str = escape_markdown(f"{speed_mbps:.2f}")
             state_str = escape_markdown(status.state.name)
             
-            telegram_message = (f"⬇️ *Downloading:* `{name_str}`\n*Progress:* {progress_str}%\n*State:* {state_str}\n*Peers:* {status.num_peers}\n*Speed:* {speed_str} MB/s")
+            telegram_message = (f"⬇️ *Downloading:*\n{name_str}\n*Progress:* {progress_str}%\n*State:* {state_str}\n*Peers:* {status.num_peers}\n*Speed:* {speed_str} MB/s")
             try:
                 await application.bot.edit_message_text(text=telegram_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
@@ -729,7 +729,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     try:
         success, ti = await download_with_progress(
             source=source_value, 
-            save_path=save_path, 
+            save_path=base_save_path,
             status_callback=report_progress,
             bot_data=application.bot_data,
             allowed_extensions=ALLOWED_EXTENSIONS
@@ -737,7 +737,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         if success and ti:
             print(f"[SUCCESS] Download task for '{clean_name}' completed. Starting post-processing.")
             
-            final_filename = "Unknown File"
             try:
                 files = ti.files()
                 target_file_path_in_torrent = None
@@ -750,25 +749,47 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                         break
                 
                 if target_file_path_in_torrent:
-                    final_filename = generate_plex_filename(source_dict['parsed_info'], original_extension)
-                    current_path = os.path.join(save_path, target_file_path_in_torrent)
-                    new_path = os.path.join(save_path, final_filename)
+                    final_filename = generate_plex_filename(parsed_info, original_extension)
+                    
+                    destination_directory = base_save_path
+                    if parsed_info.get('type') == 'tv':
+                        show_title = parsed_info.get('title', 'Unknown Show')
+                        season_num = parsed_info.get('season', 0)
+                        
+                        invalid_chars = r'<>:"/\|?*'
+                        safe_show_title = "".join(c for c in show_title if c not in invalid_chars)
+
+                        destination_directory = os.path.join(
+                            base_save_path, 
+                            safe_show_title, 
+                            f"Season {season_num:02d}"
+                        )
+                        print(f"[INFO] TV Show detected. Target directory set to: {destination_directory}")
+
+                    os.makedirs(destination_directory, exist_ok=True)
+                    
+                    current_path = os.path.join(base_save_path, target_file_path_in_torrent)
+                    new_path = os.path.join(destination_directory, final_filename)
                     
                     print(f"[MOVE] From: {current_path}\n[MOVE] To:   {new_path}")
                     shutil.move(current_path, new_path)
                     
-                    original_top_level_dir = os.path.join(save_path, target_file_path_in_torrent.split(os.path.sep)[0])
-                    if os.path.isdir(original_top_level_dir) and original_top_level_dir != new_path:
-                        print(f"[CLEANUP] Deleting original directory: {original_top_level_dir}")
-                        shutil.rmtree(original_top_level_dir)
-                else:
-                    final_filename = "Downloaded file not found in torrent info."
+                    original_top_level_dir = os.path.join(base_save_path, target_file_path_in_torrent.split(os.path.sep)[0])
+                    if os.path.isdir(original_top_level_dir) and not os.listdir(original_top_level_dir):
+                         print(f"[CLEANUP] Deleting empty original directory: {original_top_level_dir}")
+                         shutil.rmtree(original_top_level_dir)
+                    elif os.path.isfile(original_top_level_dir):
+                        pass
 
             except Exception as e:
                 print(f"[ERROR] Post-processing failed: {e}")
-                final_filename = f"Error during post-processing: {e}"
 
-            final_message = rf"✅ *Success\!* Renamed and moved to:" + f"\n`{escape_markdown(final_filename)}`"
+            # CORRECTED: Use f-string instead of rf-string for proper newline handling
+            final_message = (
+                f"✅ *Success\!*\n"
+                f"Renamed and moved to Plex Server:\n"
+                f"`{escape_markdown(clean_name)}`"
+            )
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
 
     except asyncio.CancelledError:
@@ -777,7 +798,12 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             raise
         
         print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
-        final_message = f"⏹️ *Cancelled:*\n`{escape_markdown(clean_name)}`"
+        # CORRECTED: Use f-string instead of rf-string for proper newline handling
+        final_message = (
+            f"⏹️ *Cancelled*\n"
+            f"Download has been stopped for:\n"
+            f"`{escape_markdown(clean_name)}`"
+        )
         try:
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
@@ -785,8 +811,14 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     except Exception as e:
         print(f"[ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
         safe_error = escape_markdown(str(e))
+        # CORRECTED: Use f-string instead of rf-string for proper newline handling
+        final_message = (
+            f"❌ *Error*\n"
+            f"An unexpected error occurred:\n"
+            f"`{safe_error}`"
+        )
         try:
-            await application.bot.edit_message_text(text=rf"❌ *Error:* An unexpected error occurred\." + f"\n`{safe_error}`", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+            await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
     finally:
@@ -800,12 +832,11 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             if source_type == 'file' and source_value and os.path.exists(source_value):
                 os.remove(source_value)
 
-            # --- NEW: Forceful cleanup of leftover .parts files ---
-            print(f"[CLEANUP] Scanning '{save_path}' for leftover .parts files...")
+            print(f"[CLEANUP] Scanning '{base_save_path}' for leftover .parts files...")
             try:
-                for filename in os.listdir(save_path):
+                for filename in os.listdir(base_save_path):
                     if filename.endswith(".parts"):
-                        parts_file_path = os.path.join(save_path, filename)
+                        parts_file_path = os.path.join(base_save_path, filename)
                         print(f"[CLEANUP] Found and deleting leftover parts file: {parts_file_path}")
                         os.remove(parts_file_path)
             except Exception as e:
