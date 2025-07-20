@@ -34,8 +34,8 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(rf'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def get_configuration() -> tuple[str, str, list[int]]:
-    """Reads bot token, save path, and allowed user IDs from the bot_token.ini file."""
+def get_configuration() -> tuple[str, dict, list[int]]:
+    """Reads bot token, save paths, and allowed user IDs from the bot_token.ini file."""
     config = configparser.ConfigParser()
     config_path = 'bot_token.ini'
     if not os.path.exists(config_path):
@@ -43,27 +43,51 @@ def get_configuration() -> tuple[str, str, list[int]]:
     
     config.read(config_path)
     
+    # --- Read Bot Token ---
     token = config.get('telegram', 'token', fallback=None)
     if not token or token == "YOUR_SECRET_TOKEN_HERE":
-        raise ValueError(f"Bot token not found or not set in '{config_path}'. Please add '[telegram]' section with 'token = YOUR_TOKEN'.")
+        raise ValueError(f"Bot token not found or not set in '{config_path}'.")
         
-    save_path = config.get('telegram', 'save_path', fallback=None)
-    if not save_path:
-        raise ValueError(f"Download 'save_path' not found or not set in '{config_path}'. Please add it under the '[telegram]' section.")
+    # --- Read and Validate Paths ---
+    paths = {
+        'default': config.get('telegram', 'default_save_path', fallback=None),
+        'movies': config.get('telegram', 'movies_save_path', fallback=None),
+        'tv_shows': config.get('telegram', 'tv_shows_save_path', fallback=None)
+    }
 
-    # --- NEW: Read and parse the list of allowed user IDs ---
+    if not paths['default']:
+        raise ValueError("'default_save_path' is mandatory and was not found in the config file.")
+
+    # Use default path as fallback for optional paths
+    if not paths['movies']:
+        print("[INFO] 'movies_save_path' not set. Falling back to default path for movies.")
+        paths['movies'] = paths['default']
+    if not paths['tv_shows']:
+        print("[INFO] 'tv_shows_save_path' not set. Falling back to default path for TV shows.")
+        paths['tv_shows'] = paths['default']
+    
+    # Ensure all configured directories exist
+    for path_type, path_value in paths.items():
+        # --- THE FIX: Add a check to ensure path_value is not None ---
+        # This satisfies the IDE's static type checker.
+        if path_value is not None:
+            if not os.path.exists(path_value):
+                print(f"INFO: {path_type.capitalize()} path '{path_value}' not found. Creating it.")
+                os.makedirs(path_value)
+
+    # --- Read Allowed User IDs ---
     allowed_ids_str = config.get('telegram', 'allowed_user_ids', fallback='')
+    allowed_ids = []
     if not allowed_ids_str:
         print("[WARN] 'allowed_user_ids' is empty. The bot will be accessible to everyone.")
-        return token, save_path, []
+    else:
+        try:
+            allowed_ids = [int(id.strip()) for id in allowed_ids_str.split(',') if id.strip()]
+            print(f"[INFO] Bot access is restricted to the following User IDs: {allowed_ids}")
+        except ValueError:
+            raise ValueError("Invalid entry in 'allowed_user_ids'.")
 
-    try:
-        # Convert comma-separated string of IDs into a list of integers
-        allowed_ids = [int(id.strip()) for id in allowed_ids_str.split(',') if id.strip()]
-        print(f"[INFO] Bot access is restricted to the following User IDs: {allowed_ids}")
-        return token, save_path, allowed_ids
-    except ValueError:
-        raise ValueError("Invalid entry in 'allowed_user_ids'. Please provide a comma-separated list of numbers.")
+    return token, paths, allowed_ids
 
 def parse_torrent_name(name: str) -> dict:
     """
@@ -570,6 +594,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
+
     query = update.callback_query
     if not query: return
     await query.answer()
@@ -579,18 +604,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"[INFO] Received button press from user {query.from_user.id}: '{query.data}'")
 
-    if not context.user_data:
-        print(f"[WARN] Button press from user {query.from_user.id} ignored: No user_data found (session likely expired).")
+    if not context.user_data or 'pending_torrent' not in context.user_data:
+        print(f"[WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired).")
         try:
             await query.edit_message_text("This action has expired. Please send the link again.")
-        except BadRequest as e:
-            if "Message is not modified" not in str(e): raise
-        return
-
-    if 'pending_torrent' not in context.user_data:
-        print(f"[WARN] Button press from user {query.from_user.id} ignored: No pending torrent found.")
-        try:
-            await query.edit_message_text("This action has already been completed or has expired.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
         return
@@ -602,21 +619,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text("✅ Confirmation received. Your download has been queued.")
         except BadRequest as e:
-            if "Message is not modified" not in str(e):
-                raise
+            if "Message is not modified" not in str(e): raise
 
-        download_path = context.bot_data["DOWNLOAD_SAVE_PATH"]
+        # --- NEW: Path selection logic ---
+        save_paths = context.bot_data["SAVE_PATHS"]
+        parsed_info = pending_torrent.get('parsed_info', {})
+        torrent_type = parsed_info.get('type')
+
+        final_save_path = save_paths['default'] # Start with the default
+        if torrent_type == 'movie':
+            final_save_path = save_paths['movies']
+            print(f"[INFO] Torrent identified as a movie. Saving to: {final_save_path}")
+        elif torrent_type == 'tv':
+            final_save_path = save_paths['tv_shows']
+            print(f"[INFO] Torrent identified as a TV show. Saving to: {final_save_path}")
+        else:
+            print(f"[INFO] Torrent type is unknown. Saving to default path: {final_save_path}")
+        # --- End of new logic ---
+
         active_downloads = context.bot_data.get('active_downloads', {})
         
         download_data = {
             'source_dict': pending_torrent,
             'chat_id': message.chat_id,
             'message_id': message.message_id,
-            'save_path': download_path
+            'save_path': final_save_path # Use the selected path
         }
         
-        # --- FIX for Error #4 ---
-        # Pass the application object to the task wrapper
         task = asyncio.create_task(download_task_wrapper(download_data, context.application))
         download_data['task'] = task
         active_downloads[str(message.chat_id)] = download_data
@@ -628,8 +657,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await query.edit_message_text("❌ Operation cancelled by user.")
         except BadRequest as e:
-            if "Message is not modified" not in str(e):
-                raise
+            if "Message is not modified" not in str(e): raise
         if pending_torrent.get('type') == 'file' and pending_torrent.get('value') and os.path.exists(pending_torrent.get('value')):
             os.remove(pending_torrent.get('value'))
 
@@ -717,15 +745,11 @@ if __name__ == '__main__':
     PERSISTENCE_FILE = 'persistence.json'
 
     try:
-        # --- UPDATED to receive the list of allowed user IDs ---
-        BOT_TOKEN, DOWNLOAD_SAVE_PATH, ALLOWED_USER_IDS = get_configuration()
+        # --- UPDATED to receive the paths dictionary ---
+        BOT_TOKEN, SAVE_PATHS, ALLOWED_USER_IDS = get_configuration()
     except (FileNotFoundError, ValueError) as e:
         print(f"CRITICAL ERROR: {e}")
         sys.exit(1)
-
-    if not os.path.exists(DOWNLOAD_SAVE_PATH):
-        print(f"INFO: Download path '{DOWNLOAD_SAVE_PATH}' not found. Creating it.")
-        os.makedirs(DOWNLOAD_SAVE_PATH)
 
     print("Starting bot...")
     
@@ -738,13 +762,12 @@ if __name__ == '__main__':
     )
     
     # Initialize bot_data dictionaries
-    application.bot_data["DOWNLOAD_SAVE_PATH"] = DOWNLOAD_SAVE_PATH
+    # --- NEW: Store the entire paths dictionary in the bot's global context ---
+    application.bot_data["SAVE_PATHS"] = SAVE_PATHS
     application.bot_data["persistence_file"] = PERSISTENCE_FILE
-    # --- NEW: Store the list of allowed IDs in the bot's global context ---
     application.bot_data["ALLOWED_USER_IDS"] = ALLOWED_USER_IDS
     application.bot_data.setdefault('active_downloads', {})
     
-    # Handlers are defined below (no changes needed here)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
