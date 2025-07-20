@@ -389,23 +389,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
+        
     if not update.message: return
     chat_id = update.message.chat_id
     
     active_downloads = context.bot_data.get('active_downloads', {})
-    
-    # --- THE FIX ---
-    # The dictionary keys are strings (from JSON), so we must look up using a string.
     chat_id_str = str(chat_id)
     
     if chat_id_str in active_downloads:
-        print(f"[INFO] Received /cancel command from chat_id {chat_id}. Attempting to cancel active task.")
+        download_data = active_downloads[chat_id_str]
+        clean_name = download_data.get('source_dict', {}).get('clean_name', 'your download')
         
-        # Ensure the task object exists before trying to cancel it
-        if 'task' in active_downloads[chat_id_str] and not active_downloads[chat_id_str]['task'].done():
-            task: asyncio.Task = active_downloads[chat_id_str]['task']
+        print(f"[INFO] Received /cancel command from chat_id {chat_id} for '{clean_name}'.")
+        
+        if 'task' in download_data and not download_data['task'].done():
+            task: asyncio.Task = download_data['task']
             task.cancel()
-            await update.message.reply_text("✅ Cancellation request sent.")
+            
+            # --- THE FIX: Delete the user's "/cancel" message to prevent clutter ---
+            # No reply is needed because the download_task_wrapper will edit the original message.
+            try:
+                await update.message.delete()
+            except BadRequest as e:
+                print(f"[WARN] Could not delete /cancel command message: {e}")
+
         else:
             print(f"[WARN] /cancel command for chat_id {chat_id} found a record but no active task object.")
             await update.message.reply_text("⚠️ Found a record of your download, but the task is not running. It may be in a stalled state.")
@@ -416,10 +423,14 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
+        
     if not update.message or not update.message.text: return
     chat_id = update.message.chat_id
     text = update.message.text.strip()
     
+    # --- NEW: We'll delete the user's message later, so we need a reference ---
+    user_message_to_delete = update.message
+
     if str(chat_id) in context.bot_data.get('active_downloads', {}):
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
@@ -430,6 +441,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source_type: Optional[str] = None
     ti: Optional[lt.torrent_info] = None # type: ignore
 
+    # ... (The logic for handling magnets and torrent files remains identical) ...
     if text.startswith('magnet:?xt=urn:btih:'):
         source_type = 'magnet'
         source_value = text
@@ -485,7 +497,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await progress_message.edit_text(f"❌ *Unsupported File Type*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
         if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
-
+    
+    # ... (The parsing and display name logic remains identical) ...
     parsed_info = parse_torrent_name(ti.name())
     display_name = ""
 
@@ -508,6 +521,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: # type is 'unknown'
         display_name = parsed_info['title']
 
+
     file_type_str = get_dominant_file_type(ti.files())
     total_size_str = format_bytes(ti.total_size())
     
@@ -527,7 +541,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await progress_message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
     print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{display_name}'.")
-    
+
+    # --- NEW: Delete the user's original message containing the link ---
+    try:
+        await user_message_to_delete.delete()
+        print(f"[INFO] Deleted original link message from user {chat_id}.")
+    except BadRequest as e:
+        # This can happen if the bot lacks permissions or the message is too old.
+        if "Message to delete not found" in str(e) or "not enough rights" in str(e):
+            print(f"[WARN] Could not delete user's message. Reason: {e}")
+        else:
+            raise
+
     if context.user_data is None:
         print(f"[ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
         await progress_message.edit_text(r"❌ *Error:* Could not access user session data\. Please try again\.", parse_mode=ParseMode.MARKDOWN_V2)
@@ -644,7 +669,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                     print(f"[WARN] Could not edit Telegram message: {e}")
 
     try:
-        # --- THE FIX --- Pass the entire bot_data dictionary for live state checking
         success = await download_with_progress(
             source=source_value, 
             save_path=save_path, 
@@ -653,8 +677,10 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         )
         if success:
             print(f"[SUCCESS] Download task for '{clean_name}' completed.")
+            # --- THE FIX: Change f"..." to rf"..." ---
+            final_message = rf"✅ *Success\!* The download is complete\." + f"\n`{escape_markdown(clean_name)}`"
             try:
-                await application.bot.edit_message_text(text=r"✅ *Success\!* The download is complete\.", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+                await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
                 if "Message is not modified" not in str(e): raise
     except asyncio.CancelledError:
@@ -663,8 +689,9 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             raise
         
         print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
+        final_message = f"⏹️ *Cancelled:*\n`{escape_markdown(clean_name)}`"
         try:
-            await application.bot.edit_message_text(text=r"⏹️ *Cancelled:* The download was successfully stopped\.", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+            await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
     except Exception as e:
