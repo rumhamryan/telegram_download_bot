@@ -1,4 +1,8 @@
 # file: telegram_bot.py
+
+import wikipedia
+from bs4 import BeautifulSoup
+from bs4.element import Tag
 import asyncio
 import httpx
 import json
@@ -48,24 +52,141 @@ def get_configuration() -> tuple[str, str]:
 
     return token, save_path
 
-def clean_filename(name: str) -> str:
+def parse_torrent_name(name: str) -> dict:
+    """
+    Parses a torrent name to identify if it's a movie or a TV show
+    and extracts relevant metadata.
+    """
+    # Normalize by replacing dots and underscores with spaces
     cleaned_name = re.sub(r'[\._]', ' ', name)
-    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', cleaned_name)
+    
+    # --- TV Show Detection ---
+    # Patterns: S01E02, s01e02, 1x02, etc. Case-insensitive.
+    tv_match = re.search(r'(?i)\b(S(\d{1,2})E(\d{1,2})|(\d{1,2})x(\d{1,2}))\b', cleaned_name)
+    if tv_match:
+        # The text before the season/episode marker is the title
+        title = cleaned_name[:tv_match.start()].strip()
+        
+        # Extract season and episode from the correct regex capture groups
+        if tv_match.group(2) is not None: # Matched SXXEXX
+            season = int(tv_match.group(2))
+            episode = int(tv_match.group(3))
+        else: # Matched XxXX
+            season = int(tv_match.group(4))
+            episode = int(tv_match.group(5))
+            
+        # Clean up trailing characters from the title
+        title = re.sub(r'[\s-]+$', '', title).strip()
+        
+        return {'type': 'tv', 'title': title, 'season': season, 'episode': episode}
 
+    # --- Movie Detection ---
+    # Pattern: A four-digit year (19xx or 20xx)
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', cleaned_name)
     if year_match:
         year = year_match.group(1)
+        # The text before the year is the title
         title = cleaned_name[:year_match.start()].strip()
-        title = re.sub(r'\s*\(.*?\)\s*', '', title).strip()
-        return f"{title} ({year})"
-    else:
-        tags_to_remove = [
-            r'\[.*?\]', r'\(.*?\)',
-            r'\b(1080p|720p|480p|x264|x265|hevc|BluRay|WEB-DL|AAC|DTS|HDTV|RM4k|CC|10bit|commentary|HeVK)\b'
-        ]
-        regex_pattern = '|'.join(tags_to_remove)
-        no_ext = os.path.splitext(cleaned_name)[0]
-        cleaned_name = re.sub(regex_pattern, '', no_ext, flags=re.I)
-        return re.sub(r'\s+', ' ', cleaned_name).strip()
+        
+        # Clean up title by removing any surrounding brackets
+        title = re.sub(r'^\s*\(|\)\s*$', '', title).strip()
+
+        return {'type': 'movie', 'title': title, 'year': year}
+
+    # --- Fallback for names that don't match movie/TV patterns ---
+    tags_to_remove = [
+        r'\[.*?\]', r'\(.*?\)',
+        r'\b(1080p|720p|480p|x264|x265|hevc|BluRay|WEB-DL|AAC|DTS|HDTV|RM4k|CC|10bit|commentary|HeVK)\b'
+    ]
+    regex_pattern = '|'.join(tags_to_remove)
+    no_ext = os.path.splitext(cleaned_name)[0]
+    title = re.sub(regex_pattern, '', no_ext, flags=re.I)
+    title = re.sub(r'\s+', ' ', title).strip()
+    return {'type': 'unknown', 'title': title}
+
+async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
+    """
+    Fetches an episode title by scraping the show's episode list from Wikipedia.
+    This version includes robust type and None checking to resolve IDE errors.
+    """
+    search_query = f"List of {show_title} episodes"
+    print(f"[INFO] Searching Wikipedia for: '{search_query}'")
+
+    try:
+        page = wikipedia.page(search_query, auto_suggest=False, redirect=True)
+        html = page.html()
+    except wikipedia.exceptions.PageError:
+        print(f"[WARN] Wikipedia page not found for query: '{search_query}'")
+        return None
+    except wikipedia.exceptions.DisambiguationError as e:
+        print(f"[WARN] Wikipedia search for '{show_title}' is ambiguous. Options: {e.options}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] An unexpected error occurred fetching from Wikipedia: {e}")
+        return None
+
+    soup = BeautifulSoup(html, 'lxml')
+    tables = soup.find_all('table', class_='wikitable')
+
+    if not tables:
+        print(f"[WARN] No 'wikitable' found on the Wikipedia page for '{show_title}'.")
+        return None
+
+    for table in tables:
+        # --- FIX for Errors 1 & 2: Ensure `table` is a Tag before using its methods ---
+        if not isinstance(table, Tag):
+            continue
+
+        rows = table.find_all('tr')
+        for row in rows[1:]:  # Skip header row
+            # --- FIX for Errors 3 & 4: Ensure `row` is a Tag ---
+            if not isinstance(row, Tag):
+                continue
+
+            cells = row.find_all(['td', 'th'])
+            if len(cells) < 3:
+                continue
+
+            try:
+                # Heuristic: Check the first two columns to identify the correct row.
+                # This logic is kept simple and checks for matching season/episode numbers.
+                cell_texts = [c.get_text(strip=True) for c in cells]
+                
+                # Weak validation: This is a tricky problem. We'll assume a common format
+                # where the row text contains the season and episode number.
+                is_match = False
+                row_text_for_match = ' '.join(cell_texts)
+                # Matches patterns like "2 5", "S02E05", "2.05" etc.
+                if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
+                    is_match = True
+
+                if is_match:
+                    # Assume title is in the third column (index 2)
+                    title_cell = cells[2]
+                    
+                    # --- FIX: Ensure title_cell is also a Tag before searching within it ---
+                    if not isinstance(title_cell, Tag):
+                        continue
+
+                    # --- FIX for Errors 5 & 6: `find` is a valid method on a Tag ---
+                    # It returns a NavigableString (a kind of PageElement) or None.
+                    found_text_element = title_cell.find(text=re.compile(r'"([^"]+)"'))
+
+                    # --- FIX for Errors 7, 8 & 9: Check for None and convert type before use ---
+                    if found_text_element:
+                        # 1. Convert the found element (NavigableString) to a standard string
+                        title_str = str(found_text_element)
+                        # 2. Now it's safe to call .strip()
+                        cleaned_title = title_str.strip().strip('"')
+                        print(f"[INFO] Wikipedia: Found episode title: '{cleaned_title}'")
+                        return cleaned_title
+            
+            except (ValueError, IndexError):
+                # This row is malformed or doesn't fit the expected pattern, so we skip it.
+                continue
+    
+    print(f"[WARN] Wikipedia: Could not find S{season:02d}E{episode:02d} in any table.")
+    return None
 
 def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
     if files.num_files() == 0: return "N/A"
@@ -256,7 +377,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text.strip()
     
-    if chat_id in context.bot_data.get('active_downloads', {}):
+    if str(chat_id) in context.bot_data.get('active_downloads', {}):
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
@@ -286,11 +407,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            # --- PERSISTENCE CHANGE: Save .torrent file permanently ---
-            # Create torrent_info object from memory content first
             ti = lt.torrent_info(torrent_content) # type: ignore
-            
-            # Create a persistent path based on the torrent's unique info-hash
             info_hash = str(ti.info_hashes().v1) # type: ignore
             torrents_dir = ".torrents"
             os.makedirs(torrents_dir, exist_ok=True)
@@ -326,13 +443,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
 
-    cleaned_name_str = clean_filename(ti.name())
+    parsed_info = parse_torrent_name(ti.name())
+    display_name = ""
+
+    if parsed_info['type'] == 'movie':
+        display_name = f"{parsed_info['title']} ({parsed_info['year']})"
+    
+    elif parsed_info['type'] == 'tv':
+        await progress_message.edit_text("📺 TV show detected. Searching Wikipedia for episode title...")
+        
+        episode_title = await fetch_episode_title_from_wikipedia(
+            show_title=parsed_info['title'],
+            season=parsed_info['season'],
+            episode=parsed_info['episode']
+        )
+        parsed_info['episode_title'] = episode_title
+        
+        base_name = f"{parsed_info['title']} - S{parsed_info['season']:02d}E{parsed_info['episode']:02d}"
+        display_name = f"{base_name} - {episode_title}" if episode_title else base_name
+
+    else: # type is 'unknown'
+        display_name = parsed_info['title']
+
     file_type_str = get_dominant_file_type(ti.files())
     total_size_str = format_bytes(ti.total_size())
     
     confirmation_text = (
         f"✅ *Validation Passed*\n\n"
-        f"*Name:* {escape_markdown(cleaned_name_str)}\n"
+        f"*Name:* {escape_markdown(display_name)}\n"
         f"*File Type:* {escape_markdown(file_type_str)}\n"
         f"*Size:* {escape_markdown(total_size_str)}\n\n"
         f"Do you want to start this download?"
@@ -345,7 +483,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await progress_message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{cleaned_name_str}'.")
+    print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{display_name}'.")
     
     if context.user_data is None:
         print(f"[ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
@@ -357,7 +495,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['pending_torrent'] = {
         'type': source_type, 
         'value': source_value, 
-        'clean_name': cleaned_name_str
+        'clean_name': display_name,
+        'parsed_info': parsed_info
     }
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
