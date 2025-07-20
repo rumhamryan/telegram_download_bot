@@ -14,7 +14,7 @@ import configparser
 import sys
 import math
 from typing import Optional, Dict
-import functools
+import shutil
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -141,6 +141,33 @@ def parse_torrent_name(name: str) -> dict:
     title = re.sub(r'\s+', ' ', title).strip()
     return {'type': 'unknown', 'title': title}
 
+def generate_plex_filename(parsed_info: dict, original_extension: str) -> str:
+    """Generates a clean, Plex-friendly filename from the parsed info."""
+    title = parsed_info.get('title', 'Unknown Title')
+    
+    # Sanitize title to remove characters invalid for filenames
+    # A simple approach: remove common invalid chars. For a more robust solution, a dedicated library might be used.
+    invalid_chars = r'<>:"/\|?*'
+    safe_title = "".join(c for c in title if c not in invalid_chars)
+
+    if parsed_info.get('type') == 'movie':
+        year = parsed_info.get('year', 'Unknown Year')
+        return f"{safe_title} ({year}){original_extension}"
+    
+    elif parsed_info.get('type') == 'tv':
+        season = parsed_info.get('season', 0)
+        episode = parsed_info.get('episode', 0)
+        episode_title = parsed_info.get('episode_title')
+        
+        safe_episode_title = ""
+        if episode_title:
+            safe_episode_title = " - " + "".join(c for c in episode_title if c not in invalid_chars)
+            
+        return f"{safe_title} - S{season:02d}E{episode:02d}{safe_episode_title}{original_extension}"
+        
+    else: # Fallback for 'unknown' type
+        return f"{safe_title}{original_extension}"
+
 async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
     """
     Fetches an episode title by scraping the show's episode list from Wikipedia.
@@ -207,7 +234,7 @@ async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episo
 
                     # --- FIX for Errors 5 & 6: `find` is a valid method on a Tag ---
                     # It returns a NavigableString (a kind of PageElement) or None.
-                    found_text_element = title_cell.find(text=re.compile(r'"([^"]+)"'))
+                    found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
 
                     # --- FIX for Errors 7, 8 & 9: Check for None and convert type before use ---
                     if found_text_element:
@@ -242,13 +269,9 @@ def format_bytes(size_bytes: int) -> str:
 
 async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message) -> Optional[lt.torrent_info]: # type: ignore
     """Creates a temporary session to fetch metadata from a magnet link."""
-    await progress_message.edit_text("🔗 Magnet link detected. Fetching metadata... (This may take up to 60s)")
+    await progress_message.edit_text("🔗 Magnet link detected. Fetching metadata...")
     
-    settings = {
-        'enable_dht': True,
-        'listen_interfaces': '0.0.0.0:6881',
-        'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881'
-    }
+    settings = { 'enable_dht': True, 'listen_interfaces': '0.0.0.0:6881', 'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881' }
     ses = lt.session(settings) # type: ignore
 
     params = lt.parse_magnet_uri(magnet_link) # type: ignore
@@ -257,20 +280,27 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
     handle = ses.add_torrent(params)
 
     for i in range(60): # 60 second timeout
-        if not handle.is_valid():
-            print("[ERROR] Magnet link handle became invalid during metadata fetch.")
-            return None
-
         if handle.status().has_metadata:
             print(f"[INFO] Metadata fetched successfully for magnet after {i}s.")
-            # --- FIX for DeprecationWarning ---
-            # The modern way to get torrent_info is via torrent_file()
             info = handle.torrent_file() 
             ses.remove_torrent(handle)
             return info
+        
+        # --- THE FIX: Lowered update interval from 10 to 3 seconds ---
+        if i > 0 and i % 3 == 0:
+            s = handle.status()
+            peer_count = s.num_peers
+            print(f"[LOG] Magnet metadata fetch progress: {peer_count} peers found.")
+            try:
+                await progress_message.edit_text(f"🔗 Fetching metadata... (may take up to 60s)\nPeers found: {peer_count}")
+            except BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    print(f"[WARN] Could not edit progress message for magnet fetch: {e}")
+        
         await asyncio.sleep(1)
 
     print("[ERROR] Timed out fetching metadata from magnet link.")
+    await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive.", parse_mode=ParseMode.MARKDOWN_V2)
     ses.remove_torrent(handle)
     return None
 
@@ -673,6 +703,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     
     print(f"[INFO] Starting/Resuming download task for '{clean_name}' for chat_id {chat_id}.")
     
+    # ... (report_progress inner function is unchanged) ...
     last_update_time = 0
     async def report_progress(status: lt.torrent_status): #type: ignore
         nonlocal last_update_time
@@ -693,24 +724,53 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             try:
                 await application.bot.edit_message_text(text=telegram_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
-                if "Message is not modified" not in str(e):
-                    print(f"[WARN] Could not edit Telegram message: {e}")
+                if "Message is not modified" not in str(e): print(f"[WARN] Could not edit Telegram message: {e}")
 
     try:
-        success = await download_with_progress(
+        success, ti = await download_with_progress(
             source=source_value, 
             save_path=save_path, 
             status_callback=report_progress,
-            bot_data=application.bot_data
+            bot_data=application.bot_data,
+            allowed_extensions=ALLOWED_EXTENSIONS
         )
-        if success:
-            print(f"[SUCCESS] Download task for '{clean_name}' completed.")
-            # --- THE FIX: Change f"..." to rf"..." ---
-            final_message = rf"✅ *Success\!* The download is complete\." + f"\n`{escape_markdown(clean_name)}`"
+        if success and ti:
+            print(f"[SUCCESS] Download task for '{clean_name}' completed. Starting post-processing.")
+            
+            final_filename = "Unknown File"
             try:
-                await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
-            except BadRequest as e:
-                if "Message is not modified" not in str(e): raise
+                files = ti.files()
+                target_file_path_in_torrent = None
+                original_extension = ".mkv"
+                for i in range(files.num_files()):
+                    _, ext = os.path.splitext(files.file_path(i))
+                    if ext.lower() in ALLOWED_EXTENSIONS:
+                        target_file_path_in_torrent = files.file_path(i)
+                        original_extension = ext
+                        break
+                
+                if target_file_path_in_torrent:
+                    final_filename = generate_plex_filename(source_dict['parsed_info'], original_extension)
+                    current_path = os.path.join(save_path, target_file_path_in_torrent)
+                    new_path = os.path.join(save_path, final_filename)
+                    
+                    print(f"[MOVE] From: {current_path}\n[MOVE] To:   {new_path}")
+                    shutil.move(current_path, new_path)
+                    
+                    original_top_level_dir = os.path.join(save_path, target_file_path_in_torrent.split(os.path.sep)[0])
+                    if os.path.isdir(original_top_level_dir) and original_top_level_dir != new_path:
+                        print(f"[CLEANUP] Deleting original directory: {original_top_level_dir}")
+                        shutil.rmtree(original_top_level_dir)
+                else:
+                    final_filename = "Downloaded file not found in torrent info."
+
+            except Exception as e:
+                print(f"[ERROR] Post-processing failed: {e}")
+                final_filename = f"Error during post-processing: {e}"
+
+            final_message = rf"✅ *Success\!* Renamed and moved to:" + f"\n`{escape_markdown(final_filename)}`"
+            await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+
     except asyncio.CancelledError:
         if application.bot_data.get('is_shutting_down', False):
             print(f"[INFO] Task for '{clean_name}' paused due to bot shutdown.")
@@ -737,8 +797,19 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 del active_downloads[str(chat_id)]
                 save_active_downloads(application.bot_data['persistence_file'], active_downloads)
 
-            if source_type == 'file' and os.path.exists(source_value):
+            if source_type == 'file' and source_value and os.path.exists(source_value):
                 os.remove(source_value)
+
+            # --- NEW: Forceful cleanup of leftover .parts files ---
+            print(f"[CLEANUP] Scanning '{save_path}' for leftover .parts files...")
+            try:
+                for filename in os.listdir(save_path):
+                    if filename.endswith(".parts"):
+                        parts_file_path = os.path.join(save_path, filename)
+                        print(f"[CLEANUP] Found and deleting leftover parts file: {parts_file_path}")
+                        os.remove(parts_file_path)
+            except Exception as e:
+                print(f"[ERROR] Could not perform .parts file cleanup: {e}")
 
 # --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
