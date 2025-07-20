@@ -1,6 +1,7 @@
 # file: telegram_bot.py
 import asyncio
 import httpx
+import json
 import os
 import tempfile
 import time
@@ -11,7 +12,7 @@ import math
 from typing import Optional, Dict
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 import libtorrent as lt
@@ -141,6 +142,80 @@ def validate_torrent_files(ti: lt.torrent_info) -> Optional[str]: # type: ignore
 
     return None
 
+# --- PERSISTENCE FUNCTIONS ---
+
+def save_active_downloads(file_path: str, active_downloads: Dict):
+    """Saves the state of active downloads to a JSON file."""
+    # We only want to save the data needed to restart the task, not the live task object itself.
+    data_to_save = {}
+    for chat_id, download_data in active_downloads.items():
+        # Create a copy and remove the non-serializable asyncio.Task
+        serializable_data = download_data.copy()
+        serializable_data.pop('task', None) 
+        data_to_save[chat_id] = serializable_data
+
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(data_to_save, f, indent=4)
+        print(f"[INFO] Saved {len(data_to_save)} active download(s) to {file_path}")
+    except Exception as e:
+        print(f"[ERROR] Could not save persistence file: {e}")
+
+def load_active_downloads(file_path: str) -> Dict:
+    """Loads the state of active downloads from a JSON file."""
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            print(f"[INFO] Loaded {len(data)} active download(s) from {file_path}")
+            return data
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"[ERROR] Could not read or parse persistence file '{file_path}': {e}. Starting fresh.")
+        return {}
+    
+async def post_init(application: Application):
+    """Resumes any active downloads after the bot has been initialized."""
+    print("--- Resuming active downloads ---")
+    persistence_file = application.bot_data['persistence_file']
+    active_downloads = load_active_downloads(persistence_file)
+    
+    if active_downloads:
+        for chat_id_str, download_data in active_downloads.items():
+            print(f"Resuming download for chat_id {chat_id_str}...")
+            task = asyncio.create_task(download_task_wrapper(download_data, application))
+            download_data['task'] = task # Add the live task object back
+    
+    # Store the potentially updated dict back into bot_data
+    application.bot_data['active_downloads'] = active_downloads
+    print("--- Resume process finished ---")
+
+async def post_shutdown(application: Application):
+    """Gracefully signals tasks to stop and preserves the persistence file."""
+    print("--- Shutting down: Signalling active tasks to stop ---")
+    
+    # --- SOLUTION: Set a flag before cancelling ---
+    # This tells the task wrappers that this is a shutdown, not a user cancellation.
+    application.bot_data['is_shutting_down'] = True
+    
+    active_downloads = application.bot_data.get('active_downloads', {})
+    
+    tasks_to_cancel = [
+        download_data['task'] 
+        for download_data in active_downloads.values() 
+        if 'task' in download_data and not download_data['task'].done()
+    ]
+    
+    if not tasks_to_cancel:
+        print("No active tasks to stop.")
+        return
+
+    for task in tasks_to_cancel:
+        task.cancel()
+    
+    await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+    print("--- All active tasks stopped. Shutdown complete. ---")
+
 # --- BOT HANDLER FUNCTIONS ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,11 +231,22 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     
     active_downloads = context.bot_data.get('active_downloads', {})
-    if chat_id in active_downloads:
+    
+    # --- THE FIX ---
+    # The dictionary keys are strings (from JSON), so we must look up using a string.
+    chat_id_str = str(chat_id)
+    
+    if chat_id_str in active_downloads:
         print(f"[INFO] Received /cancel command from chat_id {chat_id}. Attempting to cancel active task.")
-        task: asyncio.Task = active_downloads[chat_id]
-        task.cancel()
-        await update.message.reply_text("✅ Cancellation request sent.")
+        
+        # Ensure the task object exists before trying to cancel it
+        if 'task' in active_downloads[chat_id_str] and not active_downloads[chat_id_str]['task'].done():
+            task: asyncio.Task = active_downloads[chat_id_str]['task']
+            task.cancel()
+            await update.message.reply_text("✅ Cancellation request sent.")
+        else:
+            print(f"[WARN] /cancel command for chat_id {chat_id} found a record but no active task object.")
+            await update.message.reply_text("⚠️ Found a record of your download, but the task is not running. It may be in a stalled state.")
     else:
         print(f"[INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
         await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
@@ -178,7 +264,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     source_value: Optional[str] = None
     source_type: Optional[str] = None
-    temp_torrent_path: Optional[str] = None
     ti: Optional[lt.torrent_info] = None # type: ignore
 
     if text.startswith('magnet:?xt=urn:btih:'):
@@ -195,21 +280,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with httpx.AsyncClient() as client:
                 response = await client.get(text, follow_redirects=True, timeout=30)
                 response.raise_for_status()
+            torrent_content = response.content
         except httpx.RequestError as e:
             await progress_message.edit_text(rf"❌ *Error:* Failed to download from URL\." + f"\n`{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
             return
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".torrent") as temp_file:
-            temp_file.write(response.content)
-            temp_torrent_path = temp_file.name
-        
-        source_value = temp_torrent_path
         try:
-            ti = lt.torrent_info(temp_torrent_path) # type: ignore
+            # --- PERSISTENCE CHANGE: Save .torrent file permanently ---
+            # Create torrent_info object from memory content first
+            ti = lt.torrent_info(torrent_content) # type: ignore
+            
+            # Create a persistent path based on the torrent's unique info-hash
+            info_hash = str(ti.info_hashes().v1) # type: ignore
+            torrents_dir = ".torrents"
+            os.makedirs(torrents_dir, exist_ok=True)
+            
+            source_value = os.path.join(torrents_dir, f"{info_hash}.torrent")
+            with open(source_value, "wb") as f:
+                f.write(torrent_content)
+            print(f"[INFO] Persistently saved .torrent file to '{source_value}'")
+
         except RuntimeError:
             print(f"[ERROR] Failed to parse .torrent file for chat_id {chat_id}.")
             await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
-            os.remove(temp_torrent_path)
             return
     else:
         await progress_message.edit_text("This does not look like a valid .torrent URL or magnet link.")
@@ -217,20 +310,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ti:
         await progress_message.edit_text("❌ *Error:* Could not analyze the torrent content.", parse_mode=ParseMode.MARKDOWN_V2)
-        if temp_torrent_path and os.path.exists(temp_torrent_path): os.remove(temp_torrent_path)
+        if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
 
     if ti.total_size() > MAX_TORRENT_SIZE_BYTES:
         error_msg = f"This torrent is *{format_bytes(ti.total_size())}*, which is larger than the *{MAX_TORRENT_SIZE_GB} GB* limit."
         await progress_message.edit_text(f"❌ *Size Limit Exceeded*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
-        if temp_torrent_path and os.path.exists(temp_torrent_path): os.remove(temp_torrent_path)
+        if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
 
     validation_error = validate_torrent_files(ti)
     if validation_error:
         error_msg = f"This torrent {validation_error}"
         await progress_message.edit_text(f"❌ *Unsupported File Type*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
-        if temp_torrent_path and os.path.exists(temp_torrent_path): os.remove(temp_torrent_path)
+        if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
 
     cleaned_name_str = clean_filename(ti.name())
@@ -257,12 +350,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data is None:
         print(f"[ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
         await progress_message.edit_text(r"❌ *Error:* Could not access user session data\. Please try again\.", parse_mode=ParseMode.MARKDOWN_V2)
-        if temp_torrent_path and os.path.exists(temp_torrent_path):
-            os.remove(temp_torrent_path)
+        if source_type == 'file' and source_value and os.path.exists(source_value):
+            os.remove(source_value)
         return
         
-    # --- CHANGE IS HERE ---
-    # Store the cleaned name along with the other data
     context.user_data['pending_torrent'] = {
         'type': source_type, 
         'value': source_value, 
@@ -306,11 +397,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise
 
         download_path = context.bot_data["DOWNLOAD_SAVE_PATH"]
-        task = asyncio.create_task(download_task_wrapper(pending_torrent, message, context, download_path))
+        active_downloads = context.bot_data.get('active_downloads', {})
         
-        if 'active_downloads' not in context.bot_data:
-            context.bot_data['active_downloads'] = {}
-        context.bot_data['active_downloads'][message.chat_id] = task
+        download_data = {
+            'source_dict': pending_torrent,
+            'chat_id': message.chat_id,
+            'message_id': message.message_id,
+            'save_path': download_path
+        }
+        
+        # --- FIX for Error #4 ---
+        # Pass the application object to the task wrapper
+        task = asyncio.create_task(download_task_wrapper(download_data, context.application))
+        download_data['task'] = task
+        active_downloads[str(message.chat_id)] = download_data
+        
+        save_active_downloads(context.bot_data['persistence_file'], active_downloads)
 
     elif query.data == "cancel_operation":
         print(f"[CANCEL] Operation cancelled by user {query.from_user.id} via button.")
@@ -319,26 +421,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest as e:
             if "Message is not modified" not in str(e):
                 raise
-            
         if pending_torrent.get('type') == 'file' and pending_torrent.get('value') and os.path.exists(pending_torrent.get('value')):
             os.remove(pending_torrent.get('value'))
 
-async def download_task_wrapper(source_dict: Dict, message: Message, context: ContextTypes.DEFAULT_TYPE, save_path: str):
+async def download_task_wrapper(download_data: Dict, application: Application):
+    source_dict = download_data['source_dict']
+    chat_id = download_data['chat_id']
+    message_id = download_data['message_id']
+    save_path = download_data['save_path']
+    
     source_value = source_dict['value']
     source_type = source_dict['type']
-    # --- CHANGE IS HERE ---
-    # Retrieve the clean name, with a fallback just in case.
     clean_name = source_dict.get('clean_name', "Download")
     
-    print(f"[INFO] Starting download task for '{clean_name}' for chat_id {message.chat_id}.")
-    safe_display_name = escape_markdown(clean_name)
-    await message.edit_text(rf"⏳ Starting content download for `{safe_display_name}`\.\.", parse_mode=ParseMode.MARKDOWN_V2)
-
+    print(f"[INFO] Starting/Resuming download task for '{clean_name}' for chat_id {chat_id}.")
+    
     last_update_time = 0
-    async def report_progress(status: lt.torrent_status):   #type:ignore
+    async def report_progress(status: lt.torrent_status): #type: ignore
         nonlocal last_update_time
-        
-        # Use the raw metadata name for detailed console logging
         log_name = status.name if status.name else clean_name
         progress_percent = status.progress * 100
         speed_mbps = status.download_rate / 1024 / 1024
@@ -347,9 +447,6 @@ async def download_task_wrapper(source_dict: Dict, message: Message, context: Co
         current_time = time.monotonic()
         if current_time - last_update_time > 5:
             last_update_time = current_time
-            
-            # --- CHANGE IS HERE ---
-            # Use the consistent, cleaned name for the user-facing message
             name_str = escape_markdown(clean_name[:35] + '...' if len(clean_name) > 35 else clean_name)
             progress_str = escape_markdown(f"{progress_percent:.2f}")
             speed_str = escape_markdown(f"{speed_mbps:.2f}")
@@ -357,34 +454,61 @@ async def download_task_wrapper(source_dict: Dict, message: Message, context: Co
             
             telegram_message = (f"⬇️ *Downloading:* `{name_str}`\n*Progress:* {progress_str}%\n*State:* {state_str}\n*Peers:* {status.num_peers}\n*Speed:* {speed_str} MB/s")
             try:
-                await message.edit_text(telegram_message, parse_mode=ParseMode.MARKDOWN_V2)
+                await application.bot.edit_message_text(text=telegram_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
-                # Silently ignore "not modified" errors, but log others.
                 if "Message is not modified" not in str(e):
                     print(f"[WARN] Could not edit Telegram message: {e}")
 
     try:
-        success = await download_with_progress(source_value, save_path, report_progress)
+        # --- THE FIX --- Pass the entire bot_data dictionary for live state checking
+        success = await download_with_progress(
+            source=source_value, 
+            save_path=save_path, 
+            status_callback=report_progress,
+            bot_data=application.bot_data
+        )
         if success:
             print(f"[SUCCESS] Download task for '{clean_name}' completed.")
-            await message.edit_text(r"✅ *Success\!* The download is complete\.", parse_mode=ParseMode.MARKDOWN_V2)
+            try:
+                await application.bot.edit_message_text(text=r"✅ *Success\!* The download is complete\.", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+            except BadRequest as e:
+                if "Message is not modified" not in str(e): raise
     except asyncio.CancelledError:
-        print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {message.chat_id}.")
-        await message.edit_text(r"⏹️ *Cancelled:* The download was successfully stopped\.", parse_mode=ParseMode.MARKDOWN_V2)
+        if application.bot_data.get('is_shutting_down', False):
+            print(f"[INFO] Task for '{clean_name}' paused due to bot shutdown.")
+            raise
+        
+        print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
+        try:
+            await application.bot.edit_message_text(text=r"⏹️ *Cancelled:* The download was successfully stopped\.", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
     except Exception as e:
         print(f"[ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
         safe_error = escape_markdown(str(e))
-        await message.edit_text(rf"❌ *Error:* An unexpected error occurred\." + f"\n`{safe_error}`", parse_mode=ParseMode.MARKDOWN_V2)
+        try:
+            await application.bot.edit_message_text(text=rf"❌ *Error:* An unexpected error occurred\." + f"\n`{safe_error}`", chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): raise
     finally:
-        print(f"[INFO] Cleaning up resources for task '{clean_name}' for chat_id {message.chat_id}.")
-        active_downloads = context.bot_data.get('active_downloads', {})
-        if message.chat_id in active_downloads:
-            del active_downloads[message.chat_id]
-        if source_type == 'file' and os.path.exists(source_value):
-            os.remove(source_value)
+        if not application.bot_data.get('is_shutting_down', False):
+            print(f"[INFO] Cleaning up resources for task '{clean_name}' for chat_id {chat_id}.")
+            active_downloads = application.bot_data.get('active_downloads', {})
+            if str(chat_id) in active_downloads:
+                del active_downloads[str(chat_id)]
+                save_active_downloads(application.bot_data['persistence_file'], active_downloads)
+
+            if source_type == 'file' and os.path.exists(source_value):
+                os.remove(source_value)
 
 # --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
+    # You must have these imports at the top of telegram_bot.py
+    # import json
+    # from telegram.ext import Application
+    
+    PERSISTENCE_FILE = 'persistence.json'
+
     try:
         BOT_TOKEN, DOWNLOAD_SAVE_PATH = get_configuration()
     except (FileNotFoundError, ValueError) as e:
@@ -396,8 +520,20 @@ if __name__ == '__main__':
         os.makedirs(DOWNLOAD_SAVE_PATH)
 
     print("Starting bot...")
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # --- FIX: Use post_init and post_shutdown hooks ---
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    
+    # Initialize bot_data dictionaries
     application.bot_data["DOWNLOAD_SAVE_PATH"] = DOWNLOAD_SAVE_PATH
+    application.bot_data["persistence_file"] = PERSISTENCE_FILE
+    application.bot_data.setdefault('active_downloads', {})
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
