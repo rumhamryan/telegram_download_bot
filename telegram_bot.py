@@ -724,12 +724,35 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         current_time = time.monotonic()
         if current_time - last_update_time > 5:
             last_update_time = current_time
-            name_str = escape_markdown(clean_name[:35] + '...' if len(clean_name) > 35 else clean_name)
+
+            # --- NEW: Dynamic name formatting ---
+            name_str = ""
+            if parsed_info.get('type') == 'tv':
+                show_title = parsed_info.get('title', 'Unknown Show')
+                season_num = parsed_info.get('season', 0)
+                episode_num = parsed_info.get('episode', 0)
+                episode_title = parsed_info.get('episode_title', 'Unknown Episode')
+                
+                safe_show_title = escape_markdown(show_title)
+                safe_episode_details = escape_markdown(f"S{season_num:02d}E{episode_num:02d} - {episode_title}")
+                
+                name_str = f"`{safe_show_title}`\n`{safe_episode_details}`"
+            else: # For movies and 'unknown' types
+                safe_clean_name = escape_markdown(clean_name)
+                name_str = f"`{safe_clean_name}`"
+            # --- END of new formatting ---
+
             progress_str = escape_markdown(f"{progress_percent:.2f}")
             speed_str = escape_markdown(f"{speed_mbps:.2f}")
             state_str = escape_markdown(status.state.name)
             
-            telegram_message = (f"⬇️ *Downloading:*\n{name_str}\n*Progress:* {progress_str}%\n*State:* {state_str}\n*Peers:* {status.num_peers}\n*Speed:* {speed_str} MB/s")
+            telegram_message = (
+                f"⬇️ *Downloading:*\n{name_str}\n"
+                f"*Progress:* {progress_str}%\n"
+                f"*State:* {state_str}\n"
+                f"*Peers:* {status.num_peers}\n"
+                f"*Speed:* {speed_str} MB/s"
+            )
             try:
                 await application.bot.edit_message_text(text=telegram_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
@@ -793,9 +816,8 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             except Exception as e:
                 print(f"[ERROR] Post-processing failed: {e}")
 
-            # CORRECTED: Use f-string instead of rf-string for proper newline handling
             final_message = (
-                f"✅ *Success\!*\n" #type: ignore
+                f"✅ *Success\!*\n"
                 f"Renamed and moved to Plex Server:\n"
                 f"`{escape_markdown(clean_name)}`"
             )
@@ -807,7 +829,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             raise
         
         print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
-        # CORRECTED: Use f-string instead of rf-string for proper newline handling
         final_message = (
             f"⏹️ *Cancelled*\n"
             f"Download has been stopped for:\n"
@@ -820,7 +841,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     except Exception as e:
         print(f"[ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
         safe_error = escape_markdown(str(e))
-        # CORRECTED: Use f-string instead of rf-string for proper newline handling
         final_message = (
             f"❌ *Error*\n"
             f"An unexpected error occurred:\n"
