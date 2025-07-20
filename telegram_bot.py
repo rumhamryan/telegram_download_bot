@@ -170,86 +170,95 @@ def generate_plex_filename(parsed_info: dict, original_extension: str) -> str:
 
 async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
     """
-    Fetches an episode title by scraping the show's episode list from Wikipedia.
-    This version includes robust type and None checking to resolve IDE errors.
+    Fetches an episode title from Wikipedia with a robust, multi-stage search strategy.
     """
-    search_query = f"List of {show_title} episodes"
-    print(f"[INFO] Searching Wikipedia for: '{search_query}'")
+    html_to_scrape = None
 
+    # --- Attempt 1: Direct search for a dedicated "List of..." page ---
+    direct_search_query = f"List of {show_title} episodes"
+    print(f"[INFO] Searching Wikipedia for: '{direct_search_query}'")
     try:
-        page = wikipedia.page(search_query, auto_suggest=False, redirect=True)
-        html = page.html()
+        page = wikipedia.page(direct_search_query, auto_suggest=False, redirect=True)
+        html_to_scrape = page.html()
+        print(f"[INFO] Successfully found dedicated episode page.")
     except wikipedia.exceptions.PageError:
-        print(f"[WARN] Wikipedia page not found for query: '{search_query}'")
-        return None
-    except wikipedia.exceptions.DisambiguationError as e:
-        print(f"[WARN] Wikipedia search for '{show_title}' is ambiguous. Options: {e.options}")
-        return None
+        print(f"[WARN] No dedicated 'List of episodes' page found. Trying fallback search on main page.")
+        
+        # --- Attempt 2: Search for the main show page ---
+        try:
+            main_page = wikipedia.page(show_title, auto_suggest=True, redirect=True)
+            main_html = main_page.html()
+            soup = BeautifulSoup(main_html, 'lxml')
+
+            if soup.find('table', class_='wikitable'):
+                print("[INFO] Found episode table directly on the main show page. Using this page.")
+                html_to_scrape = main_html
+            else:
+                print("[WARN] No table found on main page. Looking for a link to an episode list.")
+                episode_link_tag = soup.find('a', href=re.compile(r'/wiki/Episodes', re.IGNORECASE))
+                if isinstance(episode_link_tag, Tag) and episode_link_tag.get('href'):
+                    link_target = episode_link_tag.get('href')
+                    print(f"[INFO] Found link to separate page: '{link_target}'. Fetching it now.")
+                    new_page = wikipedia.page(link_target, auto_suggest=False)
+                    html_to_scrape = new_page.html()
+
+        except wikipedia.exceptions.PageError:
+            print(f"[ERROR] Main page for '{show_title}' could not be found.")
+        except Exception as e:
+            print(f"[ERROR] An unexpected error occurred during fallback search: {e}")
+
     except Exception as e:
-        print(f"[ERROR] An unexpected error occurred fetching from Wikipedia: {e}")
+        print(f"[ERROR] An unexpected error occurred during direct Wikipedia search: {e}")
+
+    # --- If any attempt succeeded, scrape the resulting HTML ---
+    if not html_to_scrape:
+        print(f"[ERROR] All search attempts failed. Could not find any page with episode info for '{show_title}'.")
         return None
 
-    soup = BeautifulSoup(html, 'lxml')
+    soup = BeautifulSoup(html_to_scrape, 'lxml')
     tables = soup.find_all('table', class_='wikitable')
 
     if not tables:
-        print(f"[WARN] No 'wikitable' found on the Wikipedia page for '{show_title}'.")
+        print(f"[WARN] No 'wikitable' found on the retrieved Wikipedia page.")
         return None
 
     for table in tables:
-        # --- FIX for Errors 1 & 2: Ensure `table` is a Tag before using its methods ---
-        if not isinstance(table, Tag):
-            continue
-
+        if not isinstance(table, Tag): continue
         rows = table.find_all('tr')
-        for row in rows[1:]:  # Skip header row
-            # --- FIX for Errors 3 & 4: Ensure `row` is a Tag ---
-            if not isinstance(row, Tag):
-                continue
-
+        for row in rows[1:]:
+            if not isinstance(row, Tag): continue
             cells = row.find_all(['td', 'th'])
-            if len(cells) < 3:
-                continue
+            # Ensure there are at least 2 columns now, since we need index 1
+            if len(cells) < 2: continue
 
             try:
-                # Heuristic: Check the first two columns to identify the correct row.
-                # This logic is kept simple and checks for matching season/episode numbers.
                 cell_texts = [c.get_text(strip=True) for c in cells]
                 
-                # Weak validation: This is a tricky problem. We'll assume a common format
-                # where the row text contains the season and episode number.
-                is_match = False
-                row_text_for_match = ' '.join(cell_texts)
-                # Matches patterns like "2 5", "S02E05", "2.05" etc.
+                match_found = False
+                # 1. Strict match (for multi-season shows)
+                row_text_for_match = ' '.join(cell_texts[:2])
                 if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
-                    is_match = True
+                    match_found = True
+                
+                # 2. Lenient match (for single-season/limited series)
+                elif season == 1 and re.fullmatch(str(episode), cell_texts[0]):
+                    match_found = True
 
-                if is_match:
-                    # Assume title is in the third column (index 2)
-                    title_cell = cells[2]
+                if match_found:
+                    # --- THE FIX: Look in the second column (index 1) for the title ---
+                    title_cell = cells[1] 
+                    if not isinstance(title_cell, Tag): continue
                     
-                    # --- FIX: Ensure title_cell is also a Tag before searching within it ---
-                    if not isinstance(title_cell, Tag):
-                        continue
-
-                    # --- FIX for Errors 5 & 6: `find` is a valid method on a Tag ---
-                    # It returns a NavigableString (a kind of PageElement) or None.
                     found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
-
-                    # --- FIX for Errors 7, 8 & 9: Check for None and convert type before use ---
                     if found_text_element:
-                        # 1. Convert the found element (NavigableString) to a standard string
                         title_str = str(found_text_element)
-                        # 2. Now it's safe to call .strip()
                         cleaned_title = title_str.strip().strip('"')
                         print(f"[INFO] Wikipedia: Found episode title: '{cleaned_title}'")
                         return cleaned_title
-            
             except (ValueError, IndexError):
-                # This row is malformed or doesn't fit the expected pattern, so we skip it.
                 continue
     
-    print(f"[WARN] Wikipedia: Could not find S{season:02d}E{episode:02d} in any table.")
+    print(f"[WARN] Wikipedia: Found page but could not find S{season:02d}E{episode:02d} in any table.")
     return None
 
 def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
@@ -786,7 +795,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
 
             # CORRECTED: Use f-string instead of rf-string for proper newline handling
             final_message = (
-                f"✅ *Success\!*\n"
+                f"✅ *Success\!*\n" #type: ignore
                 f"Renamed and moved to Plex Server:\n"
                 f"`{escape_markdown(clean_name)}`"
             )
