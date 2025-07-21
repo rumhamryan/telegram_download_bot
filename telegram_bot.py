@@ -16,6 +16,9 @@ import math
 from typing import Optional, Dict
 import shutil
 
+from plexapi.server import PlexServer
+from plexapi.exceptions import NotFound, Unauthorized
+
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
@@ -34,31 +37,32 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(rf'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def get_configuration() -> tuple[str, dict, list[int]]:
-    """Reads bot token, save paths, and allowed user IDs from the bot_token.ini file."""
+def get_configuration() -> tuple[str, dict, list[int], dict]:
+    """
+    Reads bot token, paths, allowed IDs, and Plex config from the config.ini file.
+    """
     config = configparser.ConfigParser()
-    config_path = 'bot_token.ini'
+    config_path = 'config.ini'
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file '{config_path}' not found. Please create it.")
     
     config.read(config_path)
     
-    # --- Read Bot Token ---
-    token = config.get('telegram', 'token', fallback=None)
-    if not token or token == "YOUR_SECRET_TOKEN_HERE":
+    # --- Read Bot Token (UPDATED KEY) ---
+    token = config.get('telegram', 'bot_token', fallback=None)
+    if not token or token == "PLACE_TOKEN_HERE":
         raise ValueError(f"Bot token not found or not set in '{config_path}'.")
         
-    # --- Read and Validate Paths ---
+    # --- Read and Validate Paths (Corrected to read from [host]) ---
     paths = {
-        'default': config.get('telegram', 'default_save_path', fallback=None),
-        'movies': config.get('telegram', 'movies_save_path', fallback=None),
-        'tv_shows': config.get('telegram', 'tv_shows_save_path', fallback=None)
+        'default': config.get('host', 'default_save_path', fallback=None),
+        'movies': config.get('host', 'movies_save_path', fallback=None),
+        'tv_shows': config.get('host', 'tv_shows_save_path', fallback=None)
     }
 
     if not paths['default']:
         raise ValueError("'default_save_path' is mandatory and was not found in the config file.")
 
-    # Use default path as fallback for optional paths
     if not paths['movies']:
         print("[INFO] 'movies_save_path' not set. Falling back to default path for movies.")
         paths['movies'] = paths['default']
@@ -66,10 +70,7 @@ def get_configuration() -> tuple[str, dict, list[int]]:
         print("[INFO] 'tv_shows_save_path' not set. Falling back to default path for TV shows.")
         paths['tv_shows'] = paths['default']
     
-    # Ensure all configured directories exist
     for path_type, path_value in paths.items():
-        # --- THE FIX: Add a check to ensure path_value is not None ---
-        # This satisfies the IDE's static type checker.
         if path_value is not None:
             if not os.path.exists(path_value):
                 print(f"INFO: {path_type.capitalize()} path '{path_value}' not found. Creating it.")
@@ -87,7 +88,20 @@ def get_configuration() -> tuple[str, dict, list[int]]:
         except ValueError:
             raise ValueError("Invalid entry in 'allowed_user_ids'.")
 
-    return token, paths, allowed_ids
+    # --- Read Plex Configuration ---
+    plex_config = {}
+    if config.has_section('plex'):
+        plex_url = config.get('plex', 'plex_url', fallback=None)
+        plex_token = config.get('plex', 'plex_token', fallback=None)
+        if plex_url and plex_token and plex_token != "YOUR_PEX_TOKEN_HERE":
+            plex_config = {'url': plex_url, 'token': plex_token}
+            print("[INFO] Plex configuration loaded successfully.")
+        else:
+            print("[WARN] Plex section found, but URL or token is missing or default. Plex scanning will be disabled.")
+    else:
+        print("[INFO] No [plex] section in config file. Plex scanning will be disabled.")
+
+    return token, paths, allowed_ids, plex_config
 
 def parse_torrent_name(name: str) -> dict:
     """
@@ -483,6 +497,54 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
         await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
 
+async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Checks the connection to the Plex Media Server."""
+    if not await is_user_authorized(update, context):
+        return
+    if not update.message: return
+
+    status_message = await update.message.reply_text("Plex Status: 🟡 Checking connection...")
+
+    plex_config = context.bot_data.get("PLEX_CONFIG", {})
+    if not plex_config:
+        await status_message.edit_text("Plex Status: ⚪️ Not configured. Please add your Plex details to the `config.ini` file.")
+        return
+
+    try:
+        print("[PLEX STATUS] Attempting to connect to Plex server...")
+        plex = PlexServer(plex_config['url'], plex_config['token'])
+        
+        # Fetching the version is a lightweight way to confirm a successful connection
+        server_version = plex.version
+        server_platform = plex.platform
+        
+        print(f"[PLEX STATUS] Success! Connected to Plex Media Server v{server_version} on {server_platform}.")
+        
+        success_text = (
+            f"Plex Status: ✅ *Connected*\n\n"
+            f"*Server Version:* `{escape_markdown(server_version)}`\n"
+            f"*Platform:* `{escape_markdown(server_platform)}`"
+        )
+        await status_message.edit_text(success_text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    except Unauthorized:
+        print("[PLEX STATUS] ERROR: Connection failed. The Plex token is invalid.")
+        error_text = (
+            "Plex Status: ❌ *Authentication Failed*\n\n"
+            "The Plex API token is incorrect\\. Please check your `config\\.ini` file\\."
+        )
+        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
+
+    except Exception as e:
+        # This will catch generic connection errors, timeouts, etc.
+        print(f"[PLEX STATUS] ERROR: An unexpected error occurred: {e}")
+        error_text = (
+            f"Plex Status: ❌ *Connection Failed*\n\n"
+            f"Could not connect to the Plex server at `{escape_markdown(plex_config['url'])}`\\. "
+            f"Please ensure the server is running and accessible\\."
+        )
+        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
@@ -724,28 +786,21 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         current_time = time.monotonic()
         if current_time - last_update_time > 5:
             last_update_time = current_time
-
-            # --- NEW: Dynamic name formatting ---
             name_str = ""
             if parsed_info.get('type') == 'tv':
                 show_title = parsed_info.get('title', 'Unknown Show')
                 season_num = parsed_info.get('season', 0)
                 episode_num = parsed_info.get('episode', 0)
                 episode_title = parsed_info.get('episode_title', 'Unknown Episode')
-                
                 safe_show_title = escape_markdown(show_title)
                 safe_episode_details = escape_markdown(f"S{season_num:02d}E{episode_num:02d} - {episode_title}")
-                
                 name_str = f"`{safe_show_title}`\n`{safe_episode_details}`"
-            else: # For movies and 'unknown' types
+            else:
                 safe_clean_name = escape_markdown(clean_name)
                 name_str = f"`{safe_clean_name}`"
-            # --- END of new formatting ---
-
             progress_str = escape_markdown(f"{progress_percent:.2f}")
             speed_str = escape_markdown(f"{speed_mbps:.2f}")
             state_str = escape_markdown(status.state.name)
-            
             telegram_message = (
                 f"⬇️ *Downloading:*\n{name_str}\n"
                 f"*Progress:* {progress_str}%\n"
@@ -768,6 +823,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         )
         if success and ti:
             print(f"[SUCCESS] Download task for '{clean_name}' completed. Starting post-processing.")
+            scan_status_message = "" # Will hold the result of the Plex scan
             
             try:
                 files = ti.files()
@@ -782,44 +838,61 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 
                 if target_file_path_in_torrent:
                     final_filename = generate_plex_filename(parsed_info, original_extension)
-                    
                     destination_directory = base_save_path
                     if parsed_info.get('type') == 'tv':
                         show_title = parsed_info.get('title', 'Unknown Show')
                         season_num = parsed_info.get('season', 0)
-                        
                         invalid_chars = r'<>:"/\|?*'
                         safe_show_title = "".join(c for c in show_title if c not in invalid_chars)
-
-                        destination_directory = os.path.join(
-                            base_save_path, 
-                            safe_show_title, 
-                            f"Season {season_num:02d}"
-                        )
-                        print(f"[INFO] TV Show detected. Target directory set to: {destination_directory}")
-
+                        destination_directory = os.path.join(base_save_path, safe_show_title, f"Season {season_num:02d}")
                     os.makedirs(destination_directory, exist_ok=True)
-                    
                     current_path = os.path.join(base_save_path, target_file_path_in_torrent)
                     new_path = os.path.join(destination_directory, final_filename)
-                    
                     print(f"[MOVE] From: {current_path}\n[MOVE] To:   {new_path}")
                     shutil.move(current_path, new_path)
                     
+                    # --- PLEX SCANNING LOGIC ---
+                    plex_config = application.bot_data.get("PLEX_CONFIG", {})
+                    if plex_config:
+                        media_type = parsed_info.get('type')
+                        library_name = None
+                        if media_type == 'movie':
+                            library_name = 'Movies'
+                        elif media_type == 'tv':
+                            library_name = 'TV Shows'
+                        
+                        if library_name:
+                            print(f"[PLEX] Attempting to scan '{library_name}' library...")
+                            try:
+                                plex = PlexServer(plex_config['url'], plex_config['token'])
+                                target_library = plex.library.section(library_name)
+                                target_library.update()
+                                print(f"[PLEX] Successfully triggered scan for '{library_name}' library.")
+                                scan_status_message = f"\n\nPlex scan for the `{escape_markdown(library_name)}` library has been initiated\\."
+                            except Unauthorized:
+                                print("[PLEX ERROR] Plex token is invalid.")
+                                scan_status_message = "\n\n*Plex Error:* Could not trigger scan due to an invalid token\\."
+                            except NotFound:
+                                print(f"[PLEX ERROR] Plex library '{library_name}' not found.")
+                                scan_status_message = f"\n\n*Plex Error:* Library `{escape_markdown(library_name)}` not found\\."
+                            except Exception as e:
+                                print(f"[PLEX ERROR] An unexpected error occurred while connecting to Plex: {e}")
+                                scan_status_message = "\n\n*Plex Error:* Could not connect to server to trigger scan\\."
+
+                    # --- CLEANUP LOGIC ---
                     original_top_level_dir = os.path.join(base_save_path, target_file_path_in_torrent.split(os.path.sep)[0])
                     if os.path.isdir(original_top_level_dir) and not os.listdir(original_top_level_dir):
                          print(f"[CLEANUP] Deleting empty original directory: {original_top_level_dir}")
                          shutil.rmtree(original_top_level_dir)
-                    elif os.path.isfile(original_top_level_dir):
-                        pass
 
             except Exception as e:
                 print(f"[ERROR] Post-processing failed: {e}")
 
             final_message = (
                 f"✅ *Success\!*\n"
-                f"Renamed and moved to Plex Server:\n"
+                f"Download complete for:\n"
                 f"`{escape_markdown(clean_name)}`"
+                f"{scan_status_message}" # Append scan status
             )
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
 
@@ -827,13 +900,8 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         if application.bot_data.get('is_shutting_down', False):
             print(f"[INFO] Task for '{clean_name}' paused due to bot shutdown.")
             raise
-        
         print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
-        final_message = (
-            f"⏹️ *Cancelled*\n"
-            f"Download has been stopped for:\n"
-            f"`{escape_markdown(clean_name)}`"
-        )
+        final_message = (f"⏹️ *Cancelled*\nDownload has been stopped for:\n`{escape_markdown(clean_name)}`")
         try:
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
@@ -841,11 +909,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     except Exception as e:
         print(f"[ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
         safe_error = escape_markdown(str(e))
-        final_message = (
-            f"❌ *Error*\n"
-            f"An unexpected error occurred:\n"
-            f"`{safe_error}`"
-        )
+        final_message = (f"❌ *Error*\nAn unexpected error occurred:\n`{safe_error}`")
         try:
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
@@ -857,10 +921,8 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             if str(chat_id) in active_downloads:
                 del active_downloads[str(chat_id)]
                 save_active_downloads(application.bot_data['persistence_file'], active_downloads)
-
             if source_type == 'file' and source_value and os.path.exists(source_value):
                 os.remove(source_value)
-
             print(f"[CLEANUP] Scanning '{base_save_path}' for leftover .parts files...")
             try:
                 for filename in os.listdir(base_save_path):
@@ -872,12 +934,13 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 print(f"[ERROR] Could not perform .parts file cleanup: {e}")
 
 # --- MAIN SCRIPT EXECUTION ---
+# --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
     PERSISTENCE_FILE = 'persistence.json'
 
     try:
-        # --- UPDATED to receive the paths dictionary ---
-        BOT_TOKEN, SAVE_PATHS, ALLOWED_USER_IDS = get_configuration()
+        # --- UPDATED to receive the Plex configuration ---
+        config, SAVE_PATHS, ALLOWED_USER_IDS, PLEX_CONFIG = get_configuration()
     except (FileNotFoundError, ValueError) as e:
         print(f"CRITICAL ERROR: {e}")
         sys.exit(1)
@@ -886,15 +949,15 @@ if __name__ == '__main__':
     
     application = (
         ApplicationBuilder()
-        .token(BOT_TOKEN)
+        .token(config)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
     
-    # Initialize bot_data dictionaries
-    # --- NEW: Store the entire paths dictionary in the bot's global context ---
+    # --- NEW: Store Plex config and other settings in bot's global context ---
     application.bot_data["SAVE_PATHS"] = SAVE_PATHS
+    application.bot_data["PLEX_CONFIG"] = PLEX_CONFIG # Add this line
     application.bot_data["persistence_file"] = PERSISTENCE_FILE
     application.bot_data["ALLOWED_USER_IDS"] = ALLOWED_USER_IDS
     application.bot_data.setdefault('active_downloads', {})
@@ -902,6 +965,7 @@ if __name__ == '__main__':
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("plexstatus", plex_status_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(button_handler))
     
