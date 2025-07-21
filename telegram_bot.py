@@ -1,5 +1,6 @@
 # file: telegram_bot.py
 
+import datetime
 import wikipedia
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -48,12 +49,10 @@ def get_configuration() -> tuple[str, dict, list[int], dict]:
     
     config.read(config_path)
     
-    # --- Read Bot Token (UPDATED KEY) ---
     token = config.get('telegram', 'bot_token', fallback=None)
     if not token or token == "PLACE_TOKEN_HERE":
         raise ValueError(f"Bot token not found or not set in '{config_path}'.")
         
-    # --- Read and Validate Paths (Corrected to read from [host]) ---
     paths = {
         'default': config.get('host', 'default_save_path', fallback=None),
         'movies': config.get('host', 'movies_save_path', fallback=None),
@@ -64,42 +63,40 @@ def get_configuration() -> tuple[str, dict, list[int], dict]:
         raise ValueError("'default_save_path' is mandatory and was not found in the config file.")
 
     if not paths['movies']:
-        print("[INFO] 'movies_save_path' not set. Falling back to default path for movies.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] 'movies_save_path' not set. Falling back to default path for movies.")
         paths['movies'] = paths['default']
     if not paths['tv_shows']:
-        print("[INFO] 'tv_shows_save_path' not set. Falling back to default path for TV shows.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] 'tv_shows_save_path' not set. Falling back to default path for TV shows.")
         paths['tv_shows'] = paths['default']
     
     for path_type, path_value in paths.items():
         if path_value is not None:
             if not os.path.exists(path_value):
-                print(f"INFO: {path_type.capitalize()} path '{path_value}' not found. Creating it.")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO: {path_type.capitalize()} path '{path_value}' not found. Creating it.")
                 os.makedirs(path_value)
 
-    # --- Read Allowed User IDs ---
     allowed_ids_str = config.get('telegram', 'allowed_user_ids', fallback='')
     allowed_ids = []
     if not allowed_ids_str:
-        print("[WARN] 'allowed_user_ids' is empty. The bot will be accessible to everyone.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] 'allowed_user_ids' is empty. The bot will be accessible to everyone.")
     else:
         try:
             allowed_ids = [int(id.strip()) for id in allowed_ids_str.split(',') if id.strip()]
-            print(f"[INFO] Bot access is restricted to the following User IDs: {allowed_ids}")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Bot access is restricted to the following User IDs: {allowed_ids}")
         except ValueError:
             raise ValueError("Invalid entry in 'allowed_user_ids'.")
 
-    # --- Read Plex Configuration ---
     plex_config = {}
     if config.has_section('plex'):
         plex_url = config.get('plex', 'plex_url', fallback=None)
         plex_token = config.get('plex', 'plex_token', fallback=None)
         if plex_url and plex_token and plex_token != "YOUR_PEX_TOKEN_HERE":
             plex_config = {'url': plex_url, 'token': plex_token}
-            print("[INFO] Plex configuration loaded successfully.")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Plex configuration loaded successfully.")
         else:
-            print("[WARN] Plex section found, but URL or token is missing or default. Plex scanning will be disabled.")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Plex section found, but URL or token is missing or default. Plex scanning will be disabled.")
     else:
-        print("[INFO] No [plex] section in config file. Plex scanning will be disabled.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] No [plex] section in config file. Plex scanning will be disabled.")
 
     return token, paths, allowed_ids, plex_config
 
@@ -181,98 +178,116 @@ def generate_plex_filename(parsed_info: dict, original_extension: str) -> str:
         
     else: # Fallback for 'unknown' type
         return f"{safe_title}{original_extension}"
+    
+def _extract_first_int(text: str) -> Optional[int]:
+    """Safely extracts the first integer from a string, ignoring trailing characters."""
+    if not text:
+        return None
+    match = re.search(r'\d+', text.strip()) # Changed from re.match to re.search
+    if match:
+        return int(match.group(0))
+    return None
 
 async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
     """
-    Fetches an episode title from Wikipedia with a robust, multi-stage search strategy.
+    (HEAVY DEBUGGING VERSION 2)
+    Fetches an episode title from Wikipedia with verbose logging. This version
+    correctly gets text directly from the header tag.
     """
     html_to_scrape = None
 
-    # --- Attempt 1: Direct search for a dedicated "List of..." page ---
-    direct_search_query = f"List of {show_title} episodes"
-    print(f"[INFO] Searching Wikipedia for: '{direct_search_query}'")
     try:
-        page = wikipedia.page(direct_search_query, auto_suggest=False, redirect=True)
-        html_to_scrape = page.html()
-        print(f"[INFO] Successfully found dedicated episode page.")
-    except wikipedia.exceptions.PageError:
-        print(f"[WARN] No dedicated 'List of episodes' page found. Trying fallback search on main page.")
-        
-        # --- Attempt 2: Search for the main show page ---
-        try:
-            main_page = wikipedia.page(show_title, auto_suggest=True, redirect=True)
-            main_html = main_page.html()
-            soup = BeautifulSoup(main_html, 'lxml')
-
-            if soup.find('table', class_='wikitable'):
-                print("[INFO] Found episode table directly on the main show page. Using this page.")
-                html_to_scrape = main_html
-            else:
-                print("[WARN] No table found on main page. Looking for a link to an episode list.")
-                episode_link_tag = soup.find('a', href=re.compile(r'/wiki/Episodes', re.IGNORECASE))
-                if isinstance(episode_link_tag, Tag) and episode_link_tag.get('href'):
-                    link_target = episode_link_tag.get('href')
-                    print(f"[INFO] Found link to separate page: '{link_target}'. Fetching it now.")
-                    new_page = wikipedia.page(link_target, auto_suggest=False)
-                    html_to_scrape = new_page.html()
-
-        except wikipedia.exceptions.PageError:
-            print(f"[ERROR] Main page for '{show_title}' could not be found.")
-        except Exception as e:
-            print(f"[ERROR] An unexpected error occurred during fallback search: {e}")
-
+        direct_search_query = f"List of {show_title} episodes"
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Searching Wikipedia for: '{direct_search_query}'")
+        page = await asyncio.to_thread(
+            wikipedia.page, direct_search_query, auto_suggest=False, redirect=True
+        )
+        html_to_scrape = await asyncio.to_thread(page.html)
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found dedicated episode page.")
     except Exception as e:
-        print(f"[ERROR] An unexpected error occurred during direct Wikipedia search: {e}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An error occurred during Wikipedia page retrieval: {e}")
+        return None
 
-    # --- If any attempt succeeded, scrape the resulting HTML ---
     if not html_to_scrape:
-        print(f"[ERROR] All search attempts failed. Could not find any page with episode info for '{show_title}'.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] All search attempts failed.")
         return None
 
     soup = BeautifulSoup(html_to_scrape, 'lxml')
-    tables = soup.find_all('table', class_='wikitable')
-
-    if not tables:
-        print(f"[WARN] No 'wikitable' found on the retrieved Wikipedia page.")
-        return None
-
-    for table in tables:
-        if not isinstance(table, Tag): continue
-        rows = table.find_all('tr')
-        for row in rows[1:]:
-            if not isinstance(row, Tag): continue
-            cells = row.find_all(['td', 'th'])
-            # Ensure there are at least 2 columns now, since we need index 1
-            if len(cells) < 2: continue
-
-            try:
-                cell_texts = [c.get_text(strip=True) for c in cells]
-                
-                match_found = False
-                # 1. Strict match (for multi-season shows)
-                row_text_for_match = ' '.join(cell_texts[:2])
-                if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
-                    match_found = True
-                
-                # 2. Lenient match (for single-season/limited series)
-                elif season == 1 and re.fullmatch(str(episode), cell_texts[0]):
-                    match_found = True
-
-                if match_found:
-                    # --- THE FIX: Look in the second column (index 1) for the title ---
-                    title_cell = cells[1] 
-                    if not isinstance(title_cell, Tag): continue
-                    
-                    found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
-                    if found_text_element:
-                        title_str = str(found_text_element)
-                        cleaned_title = title_str.strip().strip('"')
-                        print(f"[INFO] Wikipedia: Found episode title: '{cleaned_title}'")
-                        return cleaned_title
-            except (ValueError, IndexError):
-                continue
     
-    print(f"[WARN] Wikipedia: Found page but could not find S{season:02d}E{episode:02d} in any table.")
+    # --- STRATEGY 1: Find the Season Header FIRST, then find its table ---
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] === Starting Strategy 1: Find Header, then Table ===")
+    season_headers = soup.find_all('h2')
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] Found {len(season_headers)} total <h2> elements to check.")
+    
+    found_title = False
+    for i, header in enumerate(season_headers):
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] --- Checking Header {i+1}/{len(season_headers)} ---")
+        
+        # --- THE FIX: Get text directly from the header, not a nested span ---
+        header_text = header.get_text(strip=True)
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Found header text: '{header_text}'")
+        
+        if 'Season' in header_text:
+            season_in_header = _extract_first_int(header_text)
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   'Season' found. Extracted number: {season_in_header}. (Looking for: {season})")
+            
+            if season_in_header == season:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   >>> SEASON HEADER MATCH! Searching for the next table...")
+                table = header.find_next('table', class_='wikitable')
+                
+                if table:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   >>> Found a wikitable after the header. Parsing rows...")
+                    for row_idx, row in enumerate(table.find_all('tr')[1:]):
+                        cells = row.find_all(['td', 'th'])
+                        if len(cells) < 3: continue
+                        
+                        episode_cell_text = cells[1].get_text(strip=True)
+                        episode_in_row = _extract_first_int(episode_cell_text)
+                        
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]     Row {row_idx+1}: Checking cell 1 text: '{episode_cell_text}'. Extracted episode: {episode_in_row}. (Looking for: {episode})")
+                        
+                        if episode_in_row == episode:
+                            title_cell = cells[2]
+                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]       >>> EPISODE MATCH! Title cell text: '{title_cell.get_text(strip=True)}'")
+                            found_text = title_cell.find(string=re.compile(r'"([^"]+)"'))
+                            if found_text:
+                                cleaned_title = str(found_text).strip().strip('"')
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Wikipedia: Found episode title via Strategy 1: '{cleaned_title}'")
+                                return cleaned_title
+                    
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Finished parsing the correct table but did not find the episode. Aborting Strategy 1.")
+                    found_title = True 
+                    break 
+                else:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Found matching header, but NO wikitable follows it.")
+        else:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Header text does not contain 'Season'.")
+
+    if found_title:
+         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Wikipedia: Strategy 1 found the right season table but not the episode. Final result is None.")
+         return None
+
+    # --- STRATEGY 2: Fallback for General/Embedded Tables ---
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] === Strategy 1 failed. Starting Strategy 2: General Table Scan ===")
+    all_tables = soup.find_all('table', class_='wikitable')
+    for table in all_tables:
+        for row in table.find_all('tr')[1:]:
+            cells = row.find_all(['td', 'th'])
+            if len(cells) < 2: continue
+            
+            s_in_row = _extract_first_int(cells[0].get_text())
+            e_in_row = _extract_first_int(cells[1].get_text())
+            
+            if s_in_row == season and e_in_row == episode:
+                 title_cell = cells[1] 
+                 if len(cells) > 2: title_cell = cells[2] 
+                 found_text = title_cell.find(string=re.compile(r'"([^"]+)"'))
+                 if found_text:
+                     cleaned_title = str(found_text).strip().strip('"')
+                     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Wikipedia: Found episode title via Strategy 2: '{cleaned_title}'")
+                     return cleaned_title
+
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Wikipedia: Both strategies failed. Could not find S{season:02d}E{episode:02d} in any table.")
     return None
 
 def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
@@ -290,42 +305,128 @@ def format_bytes(size_bytes: int) -> str:
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
 
-async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message) -> Optional[lt.torrent_info]: # type: ignore
-    """Creates a temporary session to fetch metadata from a magnet link."""
-    await progress_message.edit_text("🔗 Magnet link detected. Fetching metadata...")
+async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]:
+    """
+    (Coordinator) Fetches metadata by running the blocking libtorrent code in a
+    separate thread, while running a responsive UI timer in the main thread.
+    """
+    cancel_timer = asyncio.Event()
+    timer_task = asyncio.create_task(
+        _update_fetch_timer(progress_message, 120, cancel_timer)
+    )
+
+    ses = context.bot_data["TORRENT_SESSION"]
     
-    settings = { 'enable_dht': True, 'listen_interfaces': '0.0.0.0:6881', 'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881' }
-    ses = lt.session(settings) # type: ignore
+    # --- ADDED: Log that the thread is being spawned ---
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Spawning worker thread for metadata fetch.")
+    bencoded_metadata = await asyncio.to_thread(_blocking_fetch_metadata, ses, magnet_link)
+    
+    cancel_timer.set()
+    await timer_task
 
-    params = lt.parse_magnet_uri(magnet_link) # type: ignore
-    params.save_path = tempfile.gettempdir() 
-    params.upload_mode = True 
-    handle = ses.add_torrent(params)
+    if bencoded_metadata:
+        # --- ADDED: Log that the thread returned successfully ---
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Worker thread returned successfully. Reconstructing torrent_info object.")
+        ti = lt.torrent_info(bencoded_metadata)
+        return ti
+    else:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
+        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded.", parse_mode=ParseMode.MARKDOWN_V2)
+        return None
+    
+def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]:
+    """
+    (PRODUCTION VERSION)
+    Uses a long-lived session provided by the main application. It only
+    creates and destroys a temporary handle. This function is synchronous and
+    is intended to be run in a separate thread.
+    """
+    try:
+        params = lt.parse_magnet_uri(magnet_link)
+        params.save_path = tempfile.gettempdir()
+        params.upload_mode = True
+        handle = ses.add_torrent(params)
 
-    for i in range(60): # 60 second timeout
-        if handle.status().has_metadata:
-            print(f"[INFO] Metadata fetched successfully for magnet after {i}s.")
-            info = handle.torrent_file() 
-            ses.remove_torrent(handle)
-            return info
+        start_time = time.monotonic()
+        timeout_seconds = 120
+
+        while time.monotonic() - start_time < timeout_seconds:
+            if handle.status().has_metadata:
+                ti = handle.torrent_file()
+                creator = lt.create_torrent(ti)
+                torrent_dict = creator.generate()
+                bencoded_metadata = lt.bencode(torrent_dict)
+                
+                ses.remove_torrent(handle) # Clean up the handle
+                return bencoded_metadata
+            
+            time.sleep(0.5)
+    
+    except Exception as e:
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts}] [ERROR] An exception occurred in the metadata worker thread: {e}")
+
+    # This part is reached on timeout or error
+    if 'handle' in locals() and handle.is_valid():
+        ses.remove_torrent(handle)
         
-        # --- THE FIX: Lowered update interval from 10 to 3 seconds ---
-        if i > 0 and i % 3 == 0:
-            s = handle.status()
-            peer_count = s.num_peers
-            print(f"[LOG] Magnet metadata fetch progress: {peer_count} peers found.")
-            try:
-                await progress_message.edit_text(f"🔗 Fetching metadata... (may take up to 60s)\nPeers found: {peer_count}")
-            except BadRequest as e:
-                if "Message is not modified" not in str(e):
-                    print(f"[WARN] Could not edit progress message for magnet fetch: {e}")
-        
-        await asyncio.sleep(1)
-
-    print("[ERROR] Timed out fetching metadata from magnet link.")
-    await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive.", parse_mode=ParseMode.MARKDOWN_V2)
-    ses.remove_torrent(handle)
     return None
+
+async def _update_fetch_timer(progress_message: Message, timeout: int, cancel_event: asyncio.Event):
+    """(Helper) Updates a message with a simple elapsed time counter."""
+    start_time = time.monotonic()
+    while not cancel_event.is_set():
+        elapsed = int(time.monotonic() - start_time)
+        if elapsed > timeout:
+            break
+            
+        text = (
+            f"⬇️ *Fetching Metadata...*\n"
+            f"`Magnet Link`\n\n"
+            f"*Please wait, this can be slow.*\n"
+            f"*The bot is NOT frozen.*\n\n"
+            f"Elapsed Time: `{elapsed}s`"
+        )
+        try:
+            await progress_message.edit_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+        except BadRequest:
+            pass # Ignore "message not modified"
+            
+        try:
+            # Wait for 1 second, but break immediately if cancelled.
+            await asyncio.wait_for(cancel_event.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            pass # This is expected.
+
+async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]:
+    """
+    (Coordinator) Fetches metadata by running the blocking libtorrent code in a
+    separate thread, while running a responsive UI timer in the main thread.
+    """
+    cancel_timer = asyncio.Event()
+    timer_task = asyncio.create_task(
+        _update_fetch_timer(progress_message, 120, cancel_timer)
+    )
+
+    # Get the global session from the application context
+    ses = context.bot_data["TORRENT_SESSION"]
+    
+    # Run the blocking code in a worker thread, passing the global session
+    bencoded_metadata = await asyncio.to_thread(_blocking_fetch_metadata, ses, magnet_link)
+    
+    # Signal the timer to stop and wait for it to finish.
+    cancel_timer.set()
+    await timer_task
+
+    if bencoded_metadata:
+        # Reconstruct the torrent_info object from the bytes in the main thread
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Reconstructing torrent_info object from bencoded data.")
+        ti = lt.torrent_info(bencoded_metadata)
+        return ti
+    else:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
+        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded.", parse_mode=ParseMode.MARKDOWN_V2)
+        return None
 
 def validate_torrent_files(ti: lt.torrent_info) -> Optional[str]: # type: ignore
     """Checks if the torrent's files are of an allowed type."""
@@ -360,29 +461,26 @@ async def is_user_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     allowed_user_ids = context.bot_data.get('ALLOWED_USER_IDS', [])
     
-    # If the allowlist is empty, everyone is authorized.
     if not allowed_user_ids:
         return True
 
     user = update.effective_user
     if not user or user.id not in allowed_user_ids:
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if user:
-            print(f"[ACCESS DENIED] User {user.id} ({user.username}) attempted to use the bot.")
+            print(f"[{ts}] [ACCESS DENIED] User {user.id} ({user.username}) attempted to use the bot.")
         else:
-            print("[ACCESS DENIED] An update with no user was received.")
+            print(f"[{ts}] [ACCESS DENIED] An update with no user was received.")
         return False
     
-    # User is in the list, so they are authorized.
     return True
 
 # --- PERSISTENCE FUNCTIONS ---
 
 def save_active_downloads(file_path: str, active_downloads: Dict):
     """Saves the state of active downloads to a JSON file."""
-    # We only want to save the data needed to restart the task, not the live task object itself.
     data_to_save = {}
     for chat_id, download_data in active_downloads.items():
-        # Create a copy and remove the non-serializable asyncio.Task
         serializable_data = download_data.copy()
         serializable_data.pop('task', None) 
         data_to_save[chat_id] = serializable_data
@@ -390,9 +488,9 @@ def save_active_downloads(file_path: str, active_downloads: Dict):
     try:
         with open(file_path, 'w') as f:
             json.dump(data_to_save, f, indent=4)
-        print(f"[INFO] Saved {len(data_to_save)} active download(s) to {file_path}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Saved {len(data_to_save)} active download(s) to {file_path}")
     except Exception as e:
-        print(f"[ERROR] Could not save persistence file: {e}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Could not save persistence file: {e}")
 
 def load_active_downloads(file_path: str) -> Dict:
     """Loads the state of active downloads from a JSON file."""
@@ -401,34 +499,33 @@ def load_active_downloads(file_path: str) -> Dict:
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
-            print(f"[INFO] Loaded {len(data)} active download(s) from {file_path}")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Loaded {len(data)} active download(s) from {file_path}")
             return data
     except (json.JSONDecodeError, IOError) as e:
-        print(f"[ERROR] Could not read or parse persistence file '{file_path}': {e}. Starting fresh.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Could not read or parse persistence file '{file_path}': {e}. Starting fresh.")
         return {}
     
 async def post_init(application: Application):
     """Resumes any active downloads after the bot has been initialized."""
-    print("--- Resuming active downloads ---")
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] --- Resuming active downloads ---")
     persistence_file = application.bot_data['persistence_file']
     active_downloads = load_active_downloads(persistence_file)
     
     if active_downloads:
         for chat_id_str, download_data in active_downloads.items():
-            print(f"Resuming download for chat_id {chat_id_str}...")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Resuming download for chat_id {chat_id_str}...")
             task = asyncio.create_task(download_task_wrapper(download_data, application))
-            download_data['task'] = task # Add the live task object back
+            download_data['task'] = task
     
-    # Store the potentially updated dict back into bot_data
     application.bot_data['active_downloads'] = active_downloads
-    print("--- Resume process finished ---")
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- Resume process finished ---")
 
 async def post_shutdown(application: Application):
     """Gracefully signals tasks to stop and preserves the persistence file."""
-    print("--- Shutting down: Signalling active tasks to stop ---")
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] --- Shutting down: Signalling active tasks to stop ---")
     
-    # --- SOLUTION: Set a flag before cancelling ---
-    # This tells the task wrappers that this is a shutdown, not a user cancellation.
     application.bot_data['is_shutting_down'] = True
     
     active_downloads = application.bot_data.get('active_downloads', {})
@@ -440,14 +537,14 @@ async def post_shutdown(application: Application):
     ]
     
     if not tasks_to_cancel:
-        print("No active tasks to stop.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No active tasks to stop.")
         return
 
     for task in tasks_to_cancel:
         task.cancel()
     
     await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-    print("--- All active tasks stopped. Shutdown complete. ---")
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] --- All active tasks stopped. Shutdown complete. ---")
 
 # --- BOT HANDLER FUNCTIONS ---
 
@@ -472,29 +569,28 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     active_downloads = context.bot_data.get('active_downloads', {})
     chat_id_str = str(chat_id)
-    
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
     if chat_id_str in active_downloads:
         download_data = active_downloads[chat_id_str]
         clean_name = download_data.get('source_dict', {}).get('clean_name', 'your download')
         
-        print(f"[INFO] Received /cancel command from chat_id {chat_id} for '{clean_name}'.")
+        print(f"[{ts}] [INFO] Received /cancel command from chat_id {chat_id} for '{clean_name}'.")
         
         if 'task' in download_data and not download_data['task'].done():
             task: asyncio.Task = download_data['task']
             task.cancel()
             
-            # --- THE FIX: Delete the user's "/cancel" message to prevent clutter ---
-            # No reply is needed because the download_task_wrapper will edit the original message.
             try:
                 await update.message.delete()
             except BadRequest as e:
-                print(f"[WARN] Could not delete /cancel command message: {e}")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Could not delete /cancel command message: {e}")
 
         else:
-            print(f"[WARN] /cancel command for chat_id {chat_id} found a record but no active task object.")
+            print(f"[{ts}] [WARN] /cancel command for chat_id {chat_id} found a record but no active task object.")
             await update.message.reply_text("⚠️ Found a record of your download, but the task is not running. It may be in a stalled state.")
     else:
-        print(f"[INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
+        print(f"[{ts}] [INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
         await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
 
 async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,6 +600,7 @@ async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not update.message: return
 
     status_message = await update.message.reply_text("Plex Status: 🟡 Checking connection...")
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     plex_config = context.bot_data.get("PLEX_CONFIG", {})
     if not plex_config:
@@ -511,14 +608,14 @@ async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        print("[PLEX STATUS] Attempting to connect to Plex server...")
-        plex = PlexServer(plex_config['url'], plex_config['token'])
+        print(f"[{ts}] [PLEX STATUS] Attempting to connect to Plex server...")
         
-        # Fetching the version is a lightweight way to confirm a successful connection
+        # Run blocking Plex calls in a separate thread
+        plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
         server_version = plex.version
         server_platform = plex.platform
         
-        print(f"[PLEX STATUS] Success! Connected to Plex Media Server v{server_version} on {server_platform}.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX STATUS] Success! Connected to Plex Media Server v{server_version} on {server_platform}.")
         
         success_text = (
             f"Plex Status: ✅ *Connected*\n\n"
@@ -528,7 +625,7 @@ async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_message.edit_text(success_text, parse_mode=ParseMode.MARKDOWN_V2)
 
     except Unauthorized:
-        print("[PLEX STATUS] ERROR: Connection failed. The Plex token is invalid.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX STATUS] ERROR: Connection failed. The Plex token is invalid.")
         error_text = (
             "Plex Status: ❌ *Authentication Failed*\n\n"
             "The Plex API token is incorrect\\. Please check your `config\\.ini` file\\."
@@ -536,8 +633,7 @@ async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
 
     except Exception as e:
-        # This will catch generic connection errors, timeouts, etc.
-        print(f"[PLEX STATUS] ERROR: An unexpected error occurred: {e}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX STATUS] ERROR: An unexpected error occurred: {e}")
         error_text = (
             f"Plex Status: ❌ *Connection Failed*\n\n"
             f"Could not connect to the Plex server at `{escape_markdown(plex_config['url'])}`\\. "
@@ -552,28 +648,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
     chat_id = update.message.chat_id
     text = update.message.text.strip()
-    
-    # --- NEW: We'll delete the user's message later, so we need a reference ---
     user_message_to_delete = update.message
 
     if str(chat_id) in context.bot_data.get('active_downloads', {}):
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
+    # --- ADDED: Log that a link has been received and is being processed ---
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Received link from chat_id {chat_id}. Starting analysis.")
+
     progress_message = await update.message.reply_text("✅ Input received. Analyzing...")
 
     source_value: Optional[str] = None
     source_type: Optional[str] = None
-    ti: Optional[lt.torrent_info] = None # type: ignore
+    ti: Optional[lt.torrent_info] = None
 
-    # ... (The logic for handling magnets and torrent files remains identical) ...
     if text.startswith('magnet:?xt=urn:btih:'):
         source_type = 'magnet'
         source_value = text
-        ti = await fetch_metadata_from_magnet(text, progress_message)
+        
+        ti = await fetch_metadata_from_magnet(text, progress_message, context)
+        
         if not ti:
-            await progress_message.edit_text(r"❌ *Error:* Could not fetch metadata from the magnet link\. It might be inactive or invalid\.", parse_mode=ParseMode.MARKDOWN_V2)
-            return
+            return # The fetch function already sent the error message
 
     elif text.startswith(('http://', 'https://')) and text.endswith('.torrent'):
         source_type = 'file'
@@ -587,18 +684,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            ti = lt.torrent_info(torrent_content) # type: ignore
-            info_hash = str(ti.info_hashes().v1) # type: ignore
+            ti = lt.torrent_info(torrent_content)
+            info_hash = str(ti.info_hashes().v1)
             torrents_dir = ".torrents"
             os.makedirs(torrents_dir, exist_ok=True)
             
             source_value = os.path.join(torrents_dir, f"{info_hash}.torrent")
             with open(source_value, "wb") as f:
                 f.write(torrent_content)
-            print(f"[INFO] Persistently saved .torrent file to '{source_value}'")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Persistently saved .torrent file to '{source_value}'")
 
         except RuntimeError:
-            print(f"[ERROR] Failed to parse .torrent file for chat_id {chat_id}.")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Failed to parse .torrent file for chat_id {chat_id}.")
             await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
             return
     else:
@@ -623,7 +720,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
     
-    # ... (The parsing and display name logic remains identical) ...
     parsed_info = parse_torrent_name(ti.name())
     display_name = ""
 
@@ -642,10 +738,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         base_name = f"{parsed_info['title']} - S{parsed_info['season']:02d}E{parsed_info['episode']:02d}"
         display_name = f"{base_name} - {episode_title}" if episode_title else base_name
-
-    else: # type is 'unknown'
+    else:
         display_name = parsed_info['title']
-
 
     file_type_str = get_dominant_file_type(ti.files())
     total_size_str = format_bytes(ti.total_size())
@@ -665,21 +759,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await progress_message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-    print(f"[INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{display_name}'.")
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{display_name}'.")
 
-    # --- NEW: Delete the user's original message containing the link ---
     try:
         await user_message_to_delete.delete()
-        print(f"[INFO] Deleted original link message from user {chat_id}.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Deleted original link message from user {chat_id}.")
     except BadRequest as e:
-        # This can happen if the bot lacks permissions or the message is too old.
         if "Message to delete not found" in str(e) or "not enough rights" in str(e):
-            print(f"[WARN] Could not delete user's message. Reason: {e}")
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Could not delete user's message. Reason: {e}")
         else:
             raise
 
     if context.user_data is None:
-        print(f"[ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
         await progress_message.edit_text(r"❌ *Error:* Could not access user session data\. Please try again\.", parse_mode=ParseMode.MARKDOWN_V2)
         if source_type == 'file' and source_value and os.path.exists(source_value):
             os.remove(source_value)
@@ -702,11 +794,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = query.message
     if not isinstance(message, Message): return
-
-    print(f"[INFO] Received button press from user {query.from_user.id}: '{query.data}'")
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    
+    print(f"[{ts}] [INFO] Received button press from user {query.from_user.id}: '{query.data}'")
 
     if not context.user_data or 'pending_torrent' not in context.user_data:
-        print(f"[WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired).")
+        print(f"[{ts}] [WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired).")
         try:
             await query.edit_message_text("This action has expired. Please send the link again.")
         except BadRequest as e:
@@ -716,27 +809,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_torrent = context.user_data.pop('pending_torrent')
     
     if query.data == "confirm_download":
-        print(f"[SUCCESS] Download confirmed by user {query.from_user.id}. Queuing download task.")
+        print(f"[{ts}] [SUCCESS] Download confirmed by user {query.from_user.id}. Queuing download task.")
         try:
             await query.edit_message_text("✅ Confirmation received. Your download has been queued.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
 
-        # --- NEW: Path selection logic ---
         save_paths = context.bot_data["SAVE_PATHS"]
         parsed_info = pending_torrent.get('parsed_info', {})
         torrent_type = parsed_info.get('type')
 
-        final_save_path = save_paths['default'] # Start with the default
+        final_save_path = save_paths['default']
         if torrent_type == 'movie':
             final_save_path = save_paths['movies']
-            print(f"[INFO] Torrent identified as a movie. Saving to: {final_save_path}")
+            print(f"[{ts}] [INFO] Torrent identified as a movie. Saving to: {final_save_path}")
         elif torrent_type == 'tv':
             final_save_path = save_paths['tv_shows']
-            print(f"[INFO] Torrent identified as a TV show. Saving to: {final_save_path}")
+            print(f"[{ts}] [INFO] Torrent identified as a TV show. Saving to: {final_save_path}")
         else:
-            print(f"[INFO] Torrent type is unknown. Saving to default path: {final_save_path}")
-        # --- End of new logic ---
+            print(f"[{ts}] [INFO] Torrent type is unknown. Saving to default path: {final_save_path}")
 
         active_downloads = context.bot_data.get('active_downloads', {})
         
@@ -744,7 +835,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'source_dict': pending_torrent,
             'chat_id': message.chat_id,
             'message_id': message.message_id,
-            'save_path': final_save_path # Use the selected path
+            'save_path': final_save_path
         }
         
         task = asyncio.create_task(download_task_wrapper(download_data, context.application))
@@ -754,7 +845,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_active_downloads(context.bot_data['persistence_file'], active_downloads)
 
     elif query.data == "cancel_operation":
-        print(f"[CANCEL] Operation cancelled by user {query.from_user.id} via button.")
+        print(f"[{ts}] [CANCEL] Operation cancelled by user {query.from_user.id} via button.")
         try:
             await query.edit_message_text("❌ Operation cancelled by user.")
         except BadRequest as e:
@@ -773,19 +864,22 @@ async def download_task_wrapper(download_data: Dict, application: Application):
     clean_name = source_dict.get('clean_name', "Download")
     parsed_info = source_dict.get('parsed_info', {})
     
-    print(f"[INFO] Starting/Resuming download task for '{clean_name}' for chat_id {chat_id}.")
+    ts_start = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts_start}] [INFO] Starting/Resuming download task for '{clean_name}' for chat_id {chat_id}.")
     
     last_update_time = 0
     async def report_progress(status: lt.torrent_status): #type: ignore
         nonlocal last_update_time
+        ts_progress = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_name = status.name if status.name else clean_name
         progress_percent = status.progress * 100
         speed_mbps = status.download_rate / 1024 / 1024
-        print(f"[LOG] {log_name}: {progress_percent:.2f}% | Peers: {status.num_peers} | Speed: {speed_mbps:.2f} MB/s")
+        print(f"[{ts_progress}] [LOG] {log_name}: {progress_percent:.2f}% | Peers: {status.num_peers} | Speed: {speed_mbps:.2f} MB/s")
 
         current_time = time.monotonic()
         if current_time - last_update_time > 5:
             last_update_time = current_time
+
             name_str = ""
             if parsed_info.get('type') == 'tv':
                 show_title = parsed_info.get('title', 'Unknown Show')
@@ -798,9 +892,11 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             else:
                 safe_clean_name = escape_markdown(clean_name)
                 name_str = f"`{safe_clean_name}`"
+
             progress_str = escape_markdown(f"{progress_percent:.2f}")
             speed_str = escape_markdown(f"{speed_mbps:.2f}")
             state_str = escape_markdown(status.state.name)
+            
             telegram_message = (
                 f"⬇️ *Downloading:*\n{name_str}\n"
                 f"*Progress:* {progress_str}%\n"
@@ -811,7 +907,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             try:
                 await application.bot.edit_message_text(text=telegram_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
             except BadRequest as e:
-                if "Message is not modified" not in str(e): print(f"[WARN] Could not edit Telegram message: {e}")
+                if "Message is not modified" not in str(e): print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Could not edit Telegram message: {e}")
 
     try:
         success, ti = await download_with_progress(
@@ -822,8 +918,8 @@ async def download_task_wrapper(download_data: Dict, application: Application):
             allowed_extensions=ALLOWED_EXTENSIONS
         )
         if success and ti:
-            print(f"[SUCCESS] Download task for '{clean_name}' completed. Starting post-processing.")
-            scan_status_message = "" # Will hold the result of the Plex scan
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Download task for '{clean_name}' completed. Starting post-processing.")
+            scan_status_message = ""
             
             try:
                 files = ti.files()
@@ -838,20 +934,30 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 
                 if target_file_path_in_torrent:
                     final_filename = generate_plex_filename(parsed_info, original_extension)
+                    
                     destination_directory = base_save_path
                     if parsed_info.get('type') == 'tv':
                         show_title = parsed_info.get('title', 'Unknown Show')
                         season_num = parsed_info.get('season', 0)
+                        
                         invalid_chars = r'<>:"/\|?*'
                         safe_show_title = "".join(c for c in show_title if c not in invalid_chars)
-                        destination_directory = os.path.join(base_save_path, safe_show_title, f"Season {season_num:02d}")
+
+                        destination_directory = os.path.join(
+                            base_save_path, 
+                            safe_show_title, 
+                            f"Season {season_num:02d}"
+                        )
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] TV Show detected. Target directory set to: {destination_directory}")
+
                     os.makedirs(destination_directory, exist_ok=True)
+                    
                     current_path = os.path.join(base_save_path, target_file_path_in_torrent)
                     new_path = os.path.join(destination_directory, final_filename)
-                    print(f"[MOVE] From: {current_path}\n[MOVE] To:   {new_path}")
+                    
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [MOVE] From: {current_path}\n[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [MOVE] To:   {new_path}")
                     shutil.move(current_path, new_path)
                     
-                    # --- PLEX SCANNING LOGIC ---
                     plex_config = application.bot_data.get("PLEX_CONFIG", {})
                     if plex_config:
                         media_type = parsed_info.get('type')
@@ -862,105 +968,125 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                             library_name = 'TV Shows'
                         
                         if library_name:
-                            print(f"[PLEX] Attempting to scan '{library_name}' library...")
+                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX] Attempting to scan '{library_name}' library...")
                             try:
-                                plex = PlexServer(plex_config['url'], plex_config['token'])
-                                target_library = plex.library.section(library_name)
-                                target_library.update()
-                                print(f"[PLEX] Successfully triggered scan for '{library_name}' library.")
+                                # Run blocking Plex call in a separate thread
+                                plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
+                                target_library = await asyncio.to_thread(plex.library.section, library_name)
+                                await asyncio.to_thread(target_library.update)
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX] Successfully triggered scan for '{library_name}' library.")
                                 scan_status_message = f"\n\nPlex scan for the `{escape_markdown(library_name)}` library has been initiated\\."
                             except Unauthorized:
-                                print("[PLEX ERROR] Plex token is invalid.")
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX ERROR] Plex token is invalid.")
                                 scan_status_message = "\n\n*Plex Error:* Could not trigger scan due to an invalid token\\."
                             except NotFound:
-                                print(f"[PLEX ERROR] Plex library '{library_name}' not found.")
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX ERROR] Plex library '{library_name}' not found.")
                                 scan_status_message = f"\n\n*Plex Error:* Library `{escape_markdown(library_name)}` not found\\."
                             except Exception as e:
-                                print(f"[PLEX ERROR] An unexpected error occurred while connecting to Plex: {e}")
+                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX ERROR] An unexpected error occurred while connecting to Plex: {e}")
                                 scan_status_message = "\n\n*Plex Error:* Could not connect to server to trigger scan\\."
-
-                    # --- CLEANUP LOGIC ---
+                    
                     original_top_level_dir = os.path.join(base_save_path, target_file_path_in_torrent.split(os.path.sep)[0])
                     if os.path.isdir(original_top_level_dir) and not os.listdir(original_top_level_dir):
-                         print(f"[CLEANUP] Deleting empty original directory: {original_top_level_dir}")
+                         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CLEANUP] Deleting empty original directory: {original_top_level_dir}")
                          shutil.rmtree(original_top_level_dir)
+                    elif os.path.isfile(original_top_level_dir):
+                        pass
 
             except Exception as e:
-                print(f"[ERROR] Post-processing failed: {e}")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Post-processing failed: {e}")
 
             final_message = (
-                f"✅ *Success\!*\n"
-                f"Download complete for:\n"
+                f"✅ *Success\\!*\n"
+                f"Renamed and moved to Plex Server:\n"
                 f"`{escape_markdown(clean_name)}`"
-                f"{scan_status_message}" # Append scan status
+                f"{scan_status_message}"
             )
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
 
     except asyncio.CancelledError:
+        ts_cancel = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if application.bot_data.get('is_shutting_down', False):
-            print(f"[INFO] Task for '{clean_name}' paused due to bot shutdown.")
+            print(f"[{ts_cancel}] [INFO] Task for '{clean_name}' paused due to bot shutdown.")
             raise
-        print(f"[CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
-        final_message = (f"⏹️ *Cancelled*\nDownload has been stopped for:\n`{escape_markdown(clean_name)}`")
+        
+        print(f"[{ts_cancel}] [CANCEL] Download task for '{clean_name}' was cancelled by user {chat_id}.")
+        final_message = (
+            f"⏹️ *Cancelled*\n"
+            f"Download has been stopped for:\n"
+            f"`{escape_markdown(clean_name)}`"
+        )
         try:
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
     except Exception as e:
-        print(f"[ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
+        ts_except = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts_except}] [ERROR] An unexpected exception occurred in download task for '{clean_name}': {e}")
         safe_error = escape_markdown(str(e))
-        final_message = (f"❌ *Error*\nAn unexpected error occurred:\n`{safe_error}`")
+        final_message = (
+            f"❌ *Error*\n"
+            f"An unexpected error occurred:\n"
+            f"`{safe_error}`"
+        )
         try:
             await application.bot.edit_message_text(text=final_message, chat_id=chat_id, message_id=message_id, parse_mode=ParseMode.MARKDOWN_V2)
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
     finally:
+        ts_final = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if not application.bot_data.get('is_shutting_down', False):
-            print(f"[INFO] Cleaning up resources for task '{clean_name}' for chat_id {chat_id}.")
+            print(f"[{ts_final}] [INFO] Cleaning up resources for task '{clean_name}' for chat_id {chat_id}.")
             active_downloads = application.bot_data.get('active_downloads', {})
             if str(chat_id) in active_downloads:
                 del active_downloads[str(chat_id)]
                 save_active_downloads(application.bot_data['persistence_file'], active_downloads)
+
             if source_type == 'file' and source_value and os.path.exists(source_value):
                 os.remove(source_value)
-            print(f"[CLEANUP] Scanning '{base_save_path}' for leftover .parts files...")
+
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CLEANUP] Scanning '{base_save_path}' for leftover .parts files...")
             try:
                 for filename in os.listdir(base_save_path):
                     if filename.endswith(".parts"):
                         parts_file_path = os.path.join(base_save_path, filename)
-                        print(f"[CLEANUP] Found and deleting leftover parts file: {parts_file_path}")
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CLEANUP] Found and deleting leftover parts file: {parts_file_path}")
                         os.remove(parts_file_path)
             except Exception as e:
-                print(f"[ERROR] Could not perform .parts file cleanup: {e}")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Could not perform .parts file cleanup: {e}")
 
-# --- MAIN SCRIPT EXECUTION ---
 # --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
     PERSISTENCE_FILE = 'persistence.json'
 
     try:
-        # --- UPDATED to receive the Plex configuration ---
-        config, SAVE_PATHS, ALLOWED_USER_IDS, PLEX_CONFIG = get_configuration()
+        BOT_TOKEN, SAVE_PATHS, ALLOWED_USER_IDS, PLEX_CONFIG = get_configuration()
     except (FileNotFoundError, ValueError) as e:
-        print(f"CRITICAL ERROR: {e}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] CRITICAL ERROR: {e}")
         sys.exit(1)
 
-    print("Starting bot...")
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting bot...")
     
     application = (
         ApplicationBuilder()
-        .token(config)
+        .token(BOT_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
     
-    # --- NEW: Store Plex config and other settings in bot's global context ---
     application.bot_data["SAVE_PATHS"] = SAVE_PATHS
-    application.bot_data["PLEX_CONFIG"] = PLEX_CONFIG # Add this line
+    application.bot_data["PLEX_CONFIG"] = PLEX_CONFIG
     application.bot_data["persistence_file"] = PERSISTENCE_FILE
     application.bot_data["ALLOWED_USER_IDS"] = ALLOWED_USER_IDS
     application.bot_data.setdefault('active_downloads', {})
+
+    # --- NEW: Create and store a single, long-lived libtorrent session ---
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Creating global libtorrent session for the application.")
+    application.bot_data["TORRENT_SESSION"] = lt.session({
+        'listen_interfaces': '0.0.0.0:6881', 
+        'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881'
+    })
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
