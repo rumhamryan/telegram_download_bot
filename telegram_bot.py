@@ -188,107 +188,148 @@ def _extract_first_int(text: str) -> Optional[int]:
         return int(match.group(0))
     return None
 
+async def _parse_dedicated_episode_page(soup: BeautifulSoup, season: int, episode: int) -> Optional[str]:
+    """
+    (Primary Strategy - CORRECTED)
+    Parses a page using the proven, flexible regex search across all tables.
+    This is the most reliable method for dedicated 'List of...' pages.
+    """
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Trying Primary Strategy: Broad Row Search")
+    
+    tables = soup.find_all('table', class_='wikitable')
+    for table in tables:
+        if not isinstance(table, Tag): continue
+        rows = table.find_all('tr')
+        for row in rows[1:]: # Skip header row
+            if not isinstance(row, Tag): continue
+            cells = row.find_all(['td', 'th'])
+            # A typical episode row has at least 3 cells (overall #, season #, title)
+            if len(cells) < 3: continue
+
+            try:
+                cell_texts = [c.get_text(strip=True) for c in cells]
+                # Combine the text of all cells to ensure the season/episode numbers are found
+                row_text_for_match = ' '.join(cell_texts)
+
+                # Use the proven, flexible regex search
+                if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
+                    # On these pages, the title is reliably in the third column (index 2)
+                    title_cell = cells[2]
+                    if not isinstance(title_cell, Tag): continue
+                    
+                    found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
+                    if found_text_element:
+                        title_str = str(found_text_element)
+                        cleaned_title = title_str.strip().strip('"')
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Found title via Primary Strategy: '{cleaned_title}'")
+                        return cleaned_title
+            except (ValueError, IndexError):
+                continue
+                
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Primary Strategy failed.")
+    return None
+
+async def _parse_embedded_episode_page(soup: BeautifulSoup, season: int, episode: int) -> Optional[str]:
+    """
+    (Fallback Strategy - CORRECTED)
+    Parses a page using proven logic for embedded episode lists, which
+    includes heuristics for both multi-season and single-season shows.
+    """
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Trying Fallback Strategy: Flexible Row Search")
+    
+    tables = soup.find_all('table', class_='wikitable')
+    for table in tables:
+        if not isinstance(table, Tag): continue
+        rows = table.find_all('tr')
+        for row in rows[1:]: # Skip header row
+            if not isinstance(row, Tag): continue
+            cells = row.find_all(['td', 'th'])
+            if len(cells) < 2: continue
+
+            try:
+                cell_texts = [c.get_text(strip=True) for c in cells]
+                
+                match_found = False
+                # Heuristic 1: Strict match (for multi-season shows)
+                row_text_for_match = ' '.join(cell_texts[:2])
+                if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
+                    match_found = True
+                
+                # Heuristic 2: Lenient match (for single-season/limited series)
+                elif season == 1 and re.fullmatch(str(episode), cell_texts[0]):
+                    match_found = True
+
+                if match_found:
+                    # For this layout, the title is reliably in the second column (index 1)
+                    title_cell = cells[1] 
+                    if not isinstance(title_cell, Tag): continue
+                    
+                    found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
+                    if found_text_element:
+                        title_str = str(found_text_element)
+                        cleaned_title = title_str.strip().strip('"')
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Found title via Fallback Strategy: '{cleaned_title}'")
+                        return cleaned_title
+            except (ValueError, IndexError):
+                # This can happen on malformed rows, just skip to the next.
+                continue
+                
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Fallback Strategy failed.")
+    return None
+
 async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
     """
-    (HEAVY DEBUGGING VERSION 2)
-    Fetches an episode title from Wikipedia with verbose logging. This version
-    correctly gets text directly from the header tag.
+    (Coordinator)
+    Fetches an episode title from Wikipedia by trying a primary strategy for
+    dedicated pages, followed by a fallback strategy for embedded lists.
     """
     html_to_scrape = None
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # --- Step 1: Find the correct Wikipedia page (using proven async logic) ---
     try:
         direct_search_query = f"List of {show_title} episodes"
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Searching Wikipedia for: '{direct_search_query}'")
+        print(f"[{ts}] [INFO] Attempting to find dedicated episode page: '{direct_search_query}'")
         page = await asyncio.to_thread(
             wikipedia.page, direct_search_query, auto_suggest=False, redirect=True
         )
         html_to_scrape = await asyncio.to_thread(page.html)
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found dedicated episode page.")
+    
+    except wikipedia.exceptions.PageError:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] No dedicated page found. Falling back to main show page search.")
+        try:
+            main_page = await asyncio.to_thread(
+                wikipedia.page, show_title, auto_suggest=True, redirect=True
+            )
+            html_to_scrape = await asyncio.to_thread(main_page.html)
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found main show page.")
+        except Exception as e:
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An unexpected error occurred during fallback page search: {e}")
+            return None
+            
     except Exception as e:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An error occurred during Wikipedia page retrieval: {e}")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An unexpected error occurred during direct Wikipedia search: {e}")
         return None
 
     if not html_to_scrape:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] All search attempts failed.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] All page search attempts failed.")
         return None
 
+    # --- Step 2: Orchestrate the parsing strategies ---
     soup = BeautifulSoup(html_to_scrape, 'lxml')
     
-    # --- STRATEGY 1: Find the Season Header FIRST, then find its table ---
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] === Starting Strategy 1: Find Header, then Table ===")
-    season_headers = soup.find_all('h2')
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] Found {len(season_headers)} total <h2> elements to check.")
+    # Attempt the primary strategy first.
+    title = await _parse_dedicated_episode_page(soup, season, episode)
     
-    found_title = False
-    for i, header in enumerate(season_headers):
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] --- Checking Header {i+1}/{len(season_headers)} ---")
-        
-        # --- THE FIX: Get text directly from the header, not a nested span ---
-        header_text = header.get_text(strip=True)
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Found header text: '{header_text}'")
-        
-        if 'Season' in header_text:
-            season_in_header = _extract_first_int(header_text)
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   'Season' found. Extracted number: {season_in_header}. (Looking for: {season})")
-            
-            if season_in_header == season:
-                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   >>> SEASON HEADER MATCH! Searching for the next table...")
-                table = header.find_next('table', class_='wikitable')
-                
-                if table:
-                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   >>> Found a wikitable after the header. Parsing rows...")
-                    for row_idx, row in enumerate(table.find_all('tr')[1:]):
-                        cells = row.find_all(['td', 'th'])
-                        if len(cells) < 3: continue
-                        
-                        episode_cell_text = cells[1].get_text(strip=True)
-                        episode_in_row = _extract_first_int(episode_cell_text)
-                        
-                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]     Row {row_idx+1}: Checking cell 1 text: '{episode_cell_text}'. Extracted episode: {episode_in_row}. (Looking for: {episode})")
-                        
-                        if episode_in_row == episode:
-                            title_cell = cells[2]
-                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]       >>> EPISODE MATCH! Title cell text: '{title_cell.get_text(strip=True)}'")
-                            found_text = title_cell.find(string=re.compile(r'"([^"]+)"'))
-                            if found_text:
-                                cleaned_title = str(found_text).strip().strip('"')
-                                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Wikipedia: Found episode title via Strategy 1: '{cleaned_title}'")
-                                return cleaned_title
-                    
-                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Finished parsing the correct table but did not find the episode. Aborting Strategy 1.")
-                    found_title = True 
-                    break 
-                else:
-                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Found matching header, but NO wikitable follows it.")
-        else:
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG]   Header text does not contain 'Season'.")
+    # If the primary strategy fails, attempt the fallback.
+    if not title:
+        title = await _parse_embedded_episode_page(soup, season, episode)
 
-    if found_title:
-         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Wikipedia: Strategy 1 found the right season table but not the episode. Final result is None.")
-         return None
+    if not title:
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Both parsing strategies failed to find S{season:02d}E{episode:02d}.")
 
-    # --- STRATEGY 2: Fallback for General/Embedded Tables ---
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI DEBUG] === Strategy 1 failed. Starting Strategy 2: General Table Scan ===")
-    all_tables = soup.find_all('table', class_='wikitable')
-    for table in all_tables:
-        for row in table.find_all('tr')[1:]:
-            cells = row.find_all(['td', 'th'])
-            if len(cells) < 2: continue
-            
-            s_in_row = _extract_first_int(cells[0].get_text())
-            e_in_row = _extract_first_int(cells[1].get_text())
-            
-            if s_in_row == season and e_in_row == episode:
-                 title_cell = cells[1] 
-                 if len(cells) > 2: title_cell = cells[2] 
-                 found_text = title_cell.find(string=re.compile(r'"([^"]+)"'))
-                 if found_text:
-                     cleaned_title = str(found_text).strip().strip('"')
-                     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Wikipedia: Found episode title via Strategy 2: '{cleaned_title}'")
-                     return cleaned_title
-
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Wikipedia: Both strategies failed. Could not find S{season:02d}E{episode:02d} in any table.")
-    return None
+    return title
 
 def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
     if files.num_files() == 0: return "N/A"
