@@ -346,7 +346,7 @@ def format_bytes(size_bytes: int) -> str:
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
 
-async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]:
+async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]: #type: ignore
     """
     (Coordinator) Fetches metadata by running the blocking libtorrent code in a
     separate thread, while running a responsive UI timer in the main thread.
@@ -368,14 +368,14 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
     if bencoded_metadata:
         # --- ADDED: Log that the thread returned successfully ---
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Worker thread returned successfully. Reconstructing torrent_info object.")
-        ti = lt.torrent_info(bencoded_metadata)
+        ti = lt.torrent_info(bencoded_metadata) #type: ignore
         return ti
     else:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
         await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded.", parse_mode=ParseMode.MARKDOWN_V2)
         return None
     
-def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]:
+def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]: #type: ignore
     """
     (PRODUCTION VERSION)
     Uses a long-lived session provided by the main application. It only
@@ -383,7 +383,7 @@ def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[byte
     is intended to be run in a separate thread.
     """
     try:
-        params = lt.parse_magnet_uri(magnet_link)
+        params = lt.parse_magnet_uri(magnet_link) #type: ignore
         params.save_path = tempfile.gettempdir()
         params.upload_mode = True
         handle = ses.add_torrent(params)
@@ -394,9 +394,9 @@ def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[byte
         while time.monotonic() - start_time < timeout_seconds:
             if handle.status().has_metadata:
                 ti = handle.torrent_file()
-                creator = lt.create_torrent(ti)
+                creator = lt.create_torrent(ti) #type: ignore
                 torrent_dict = creator.generate()
-                bencoded_metadata = lt.bencode(torrent_dict)
+                bencoded_metadata = lt.bencode(torrent_dict) #type: ignore
                 
                 ses.remove_torrent(handle) # Clean up the handle
                 return bencoded_metadata
@@ -408,8 +408,8 @@ def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[byte
         print(f"[{ts}] [ERROR] An exception occurred in the metadata worker thread: {e}")
 
     # This part is reached on timeout or error
-    if 'handle' in locals() and handle.is_valid():
-        ses.remove_torrent(handle)
+    if 'handle' in locals() and handle.is_valid(): #type: ignore
+        ses.remove_torrent(handle) #type: ignore
         
     return None
 
@@ -439,7 +439,7 @@ async def _update_fetch_timer(progress_message: Message, timeout: int, cancel_ev
         except asyncio.TimeoutError:
             pass # This is expected.
 
-async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]:
+async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]: #type: ignore
     """
     (Coordinator) Fetches metadata by running the blocking libtorrent code in a
     separate thread, while running a responsive UI timer in the main thread.
@@ -462,7 +462,7 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
     if bencoded_metadata:
         # Reconstruct the torrent_info object from the bytes in the main thread
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Reconstructing torrent_info object from bencoded data.")
-        ti = lt.torrent_info(bencoded_metadata)
+        ti = lt.torrent_info(bencoded_metadata) #type: ignore
         return ti
     else:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
@@ -702,7 +702,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     source_value: Optional[str] = None
     source_type: Optional[str] = None
-    ti: Optional[lt.torrent_info] = None
+    ti: Optional[lt.torrent_info] = None #type: ignore
 
     if text.startswith('magnet:?xt=urn:btih:'):
         source_type = 'magnet'
@@ -725,8 +725,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            ti = lt.torrent_info(torrent_content)
-            info_hash = str(ti.info_hashes().v1)
+            ti = lt.torrent_info(torrent_content) #type: ignore
+            info_hash = str(ti.info_hashes().v1) #type: ignore
             torrents_dir = ".torrents"
             os.makedirs(torrents_dir, exist_ok=True)
             
@@ -1124,7 +1124,7 @@ if __name__ == '__main__':
 
     # --- NEW: Create and store a single, long-lived libtorrent session ---
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Creating global libtorrent session for the application.")
-    application.bot_data["TORRENT_SESSION"] = lt.session({
+    application.bot_data["TORRENT_SESSION"] = lt.session({ #type: ignore
         'listen_interfaces': '0.0.0.0:6881', 
         'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881'
     })
