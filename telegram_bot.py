@@ -190,43 +190,76 @@ def _extract_first_int(text: str) -> Optional[int]:
 
 async def _parse_dedicated_episode_page(soup: BeautifulSoup, season: int, episode: int) -> Optional[str]:
     """
-    (Primary Strategy - CORRECTED)
-    Parses a page using the proven, flexible regex search across all tables.
-    This is the most reliable method for dedicated 'List of...' pages.
+    (Primary Strategy - REVISED & ROBUST)
+    Parses a dedicated 'List of...' page by using the predictable table structure.
+    It directly targets the correct table for the season and the correct column
+    for the episode number, as per the user's analysis.
     """
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Trying Primary Strategy: Broad Row Search")
-    
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] [WIKI] Applying structured parsing for S{season:02d}E{episode:02d}")
+
     tables = soup.find_all('table', class_='wikitable')
-    for table in tables:
-        if not isinstance(table, Tag): continue
-        rows = table.find_all('tr')
-        for row in rows[1:]: # Skip header row
-            if not isinstance(row, Tag): continue
-            cells = row.find_all(['td', 'th'])
-            # A typical episode row has at least 3 cells (overall #, season #, title)
-            if len(cells) < 3: continue
+    
+    # Per analysis: Table at index 0 is season summary. Table at index 1 is Season 1, etc.
+    # Therefore, the target table's index is the season number.
+    # For Season 4, we want the table at index 4 (the 5th 'wikitable' on the page).
+    target_table_index = season
+    
+    print(f"[{ts}] [WIKI] Found {len(tables)} 'wikitables'. Targeting table at index {target_table_index} for Season {season}.")
 
-            try:
-                cell_texts = [c.get_text(strip=True) for c in cells]
-                # Combine the text of all cells to ensure the season/episode numbers are found
-                row_text_for_match = ' '.join(cell_texts)
+    # --- Boundary check to ensure the target table exists ---
+    if target_table_index >= len(tables):
+        print(f"[{ts}] [WIKI ERROR] Target table index {target_table_index} is out of bounds. The page may have fewer season tables than expected.")
+        return None
 
-                # Use the proven, flexible regex search
-                if re.search(fr'\b{season}\b.*\b{episode}\b', row_text_for_match):
-                    # On these pages, the title is reliably in the third column (index 2)
-                    title_cell = cells[2]
-                    if not isinstance(title_cell, Tag): continue
-                    
-                    found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
-                    if found_text_element:
-                        title_str = str(found_text_element)
-                        cleaned_title = title_str.strip().strip('"')
-                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] Found title via Primary Strategy: '{cleaned_title}'")
-                        return cleaned_title
-            except (ValueError, IndexError):
-                continue
+    target_table = tables[target_table_index]
+    if not isinstance(target_table, Tag):
+        print(f"[{ts}] [WIKI ERROR] Target at index {target_table_index} is not a valid table tag.")
+        return None
+
+    rows = target_table.find_all('tr')
+    print(f"[{ts}] [WIKI] Processing {len(rows)} rows in the target table...")
+
+    # --- Iterate through rows of the correct season's table ---
+    for row in rows[1:]: # Skip header row
+        if not isinstance(row, Tag): continue
+        cells = row.find_all(['td', 'th'])
+
+        # A valid row needs at least 3 cells: #overall, #in_season, "Title"
+        if len(cells) < 3:
+            continue
+
+        try:
+            # Column 1 (index 1) reliably contains the episode number for the season.
+            episode_in_season_text = cells[1].get_text(strip=True)
+            episode_num_from_cell = _extract_first_int(episode_in_season_text)
+
+            # --- Direct comparison for a precise match ---
+            if episode_num_from_cell == episode:
+                print(f"[{ts}] [WIKI SUCCESS] Matched episode number {episode} in the correct column.")
                 
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Primary Strategy failed.")
+                # Column 2 (index 2) reliably contains the title.
+                title_cell = cells[2]
+                if not isinstance(title_cell, Tag): continue
+
+                # The title is usually contained within quotes.
+                found_text_element = title_cell.find(string=re.compile(r'"([^"]+)"'))
+                if found_text_element:
+                    title_str = str(found_text_element)
+                    cleaned_title = title_str.strip().strip('"')
+                    print(f"[{ts}] [WIKI SUCCESS] Extracted title: '{cleaned_title}'")
+                    return cleaned_title
+                else:
+                    # Fallback for edge cases where the title isn't in quotes
+                    cleaned_title = title_cell.get_text(strip=True)
+                    print(f"[{ts}] [WIKI WARN] Could not find title in quotes, using full cell text: '{cleaned_title}'")
+                    return cleaned_title
+
+        except (ValueError, IndexError) as e:
+            print(f"[{ts}] [WIKI WARN] Skipping a row due to a parsing error: {e}")
+            continue
+            
+    print(f"[{ts}] [WIKI] All rows in the target table were checked, but no match was found for S{season:02d}E{episode:02d}.")
     return None
 
 async def _parse_embedded_episode_page(soup: BeautifulSoup, season: int, episode: int) -> Optional[str]:
