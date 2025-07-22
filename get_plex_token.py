@@ -2,13 +2,13 @@ import requests
 import json
 import uuid
 
-# Note: 'getpass' is no longer imported as it is not used.
-
 def get_plex_token():
     """
     An interactive script to retrieve a Plex access token for a user,
     handling 2FA if necessary.
     """
+    # --- Configuration ---
+    # These settings are self-contained within the function.
     client_identifier = str(uuid.uuid4())
     PLEX_HEADERS = {
         "X-Plex-Product": "Plex Telegram Bot Setup",
@@ -19,11 +19,11 @@ def get_plex_token():
     }
     SIGN_IN_URL = "https://plex.tv/users/sign_in.json"
 
-
     print("--- Plex Token Retrieval Script ---")
     print(f"This script will guide you through retrieving your Plex access token.")
     print(f"A unique Client Identifier has been generated for this session: {client_identifier}")
     print("---------------------------------------\n")
+    print("WARNING: Your password will be visible on-screen as you type.")
 
     # 1. Get user credentials (password is now visible on input)
     username = input("Please enter your Plex username or email: ")
@@ -45,7 +45,7 @@ def get_plex_token():
     print("Request Headers:")
     print(json.dumps(PLEX_HEADERS, indent=2))
 
-    # Mask password for security in the log output
+    # Mask password for security in the log output only
     masked_payload = payload.copy()
     masked_payload['user']['password'] = '********'
     print("Request Payload:")
@@ -142,3 +142,7 @@ def get_plex_token():
         print("="*60)
     else:
         print("\n\nCould not retrieve the Plex token. Please try again.")
+
+# This block ensures the get_plex_token() function is called when the script is executed.
+if __name__ == "__main__":
+    get_plex_token()
