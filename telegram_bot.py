@@ -754,6 +754,57 @@ async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
 
+async def plex_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(NEW) Sends a request to the remote agent to restart the Plex server."""
+    if not await is_user_authorized(update, context):
+        return
+    if not update.message: return
+
+    status_message = await update.message.reply_text("Plex Restart: 🟡 Sending command...")
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+
+    agent_url = config.get('restart_agent', 'agent_url', fallback=None)
+    agent_secret = config.get('restart_agent', 'agent_secret', fallback=None)
+
+    if not agent_url or not agent_secret or agent_secret == "your_very_secret_and_long_random_string":
+        print(f"[{ts}] [PLEX RESTART] Agent is not configured in config.ini")
+        await status_message.edit_text("Plex Restart: ⚪️ Not configured. Please add `[restart_agent]` details to `config.ini`.")
+        return
+
+    print(f"[{ts}] [PLEX RESTART] Sending restart request to agent at {agent_url}")
+    headers = {"X-Auth-Token": agent_secret}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(agent_url, headers=headers, timeout=30)
+            response.raise_for_status() # Raises an exception for 4xx or 5xx status codes
+        
+        response_data = response.json()
+        print(f"[{ts}] [PLEX RESTART] Agent responded: {response_data.get('message')}")
+        await status_message.edit_text(f"✅ *Plex Restart Successful*\n\n`{escape_markdown(response_data.get('message', ''))}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+    except httpx.ConnectError:
+        error_text = f"❌ *Connection Failed*\n\nCould not connect to the restart agent at `{escape_markdown(agent_url)}`\\. Ensure the agent is running and the firewall is open\\."
+        print(f"[{ts}] [PLEX RESTART] ERROR: Connection to agent failed.")
+        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
+    except httpx.HTTPStatusError as e:
+        error_message = f"Agent returned an error: {e.response.status_code}"
+        try:
+            # Try to get a more specific error from the agent's response
+            error_message = e.response.json().get('message', 'Unknown error from agent.')
+        except Exception:
+            pass # Keep the generic status code error
+        error_text = f"❌ *Command Failed*\n\n`{escape_markdown(error_message)}`"
+        print(f"[{ts}] [PLEX RESTART] ERROR: {error_message}")
+        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        error_text = f"❌ *An Unexpected Error Occurred*\n\n`{escape_markdown(str(e))}`"
+        print(f"[{ts}] [PLEX RESTART] ERROR: {str(e)}")
+        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
@@ -1231,6 +1282,7 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?help$', re.IGNORECASE)), help_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?cancel$', re.IGNORECASE)), cancel_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?plexstatus$', re.IGNORECASE)), plex_status_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?plexrestart$', re.IGNORECASE)), plex_restart_command))
     
     # This generic handler for links/magnets now correctly comes after the specific command
     # handlers and will not be triggered by command words.
