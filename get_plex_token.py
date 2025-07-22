@@ -1,137 +1,100 @@
 import requests
 import json
 import uuid
+import time
+import webbrowser
 
 def get_plex_token():
     """
-    An interactive script to retrieve a Plex access token for a user,
-    handling 2FA if necessary.
+    An interactive script to retrieve a Plex access token by guiding the user
+    through the PIN-based authentication flow.
     """
     # --- Configuration ---
-    # These settings are self-contained within the function.
     client_identifier = str(uuid.uuid4())
-    PLEX_HEADERS = {
-        "X-Plex-Product": "Plex Telegram Bot Setup",
+    product_name = "Plex Telegram Bot Setup"
+    
+    base_headers = {
+        "X-Plex-Product": product_name,
         "X-Plex-Version": "1.0",
         "X-Plex-Platform": "Python",
-        "accept": "application/json",
         "X-Plex-Client-Identifier": client_identifier,
+        "accept": "application/json",
     }
-    SIGN_IN_URL = "https://plex.tv/users/sign_in.json"
-
-    print("--- Plex Token Retrieval Script ---")
-    print(f"This script will guide you through retrieving your Plex access token.")
-    print(f"A unique Client Identifier has been generated for this session: {client_identifier}")
-    print("---------------------------------------\n")
-    print("WARNING: Your password will be visible on-screen as you type.")
-
-    # 1. Get user credentials (password is now visible on input)
-    username = input("Please enter your Plex username or email: ")
-    password = input("Please enter your Plex password: ")
-    print("\nCredentials received. Preparing first authentication attempt...")
-    input("Press Enter to continue...")
+    
+    pins_url = "https://plex.tv/api/v2/pins"
+    
+    print("--- Plex Token Retrieval Script (PIN Auth Flow) ---")
+    print("This script will guide you through authorizing it to get a token.")
+    print("You will be asked to sign in using your web browser.")
     print("-" * 50)
+    input("Press Enter to begin...")
 
-    # 2. First authentication attempt
-    payload = {
-        "user": {
-            "login": username,
-            "password": password
-        }
-    }
-
-    print("STEP 1: Authenticating with username and password...")
-    print(f"POST Request URL: {SIGN_IN_URL}")
-    print("Request Headers:")
-    print(json.dumps(PLEX_HEADERS, indent=2))
-
-    # Mask password for security in the log output only
-    masked_payload = payload.copy()
-    masked_payload['user']['password'] = '********'
-    print("Request Payload:")
-    print(json.dumps(masked_payload, indent=2))
-    print("\n>>> Sending request...")
-
+    # 1. Get a temporary PIN from Plex
+    print("\nSTEP 1: Requesting a PIN from Plex...")
     try:
-        response = requests.post(SIGN_IN_URL, headers=PLEX_HEADERS, json=payload)
+        response = requests.post(pins_url, headers=base_headers, data={'strong': 'true'})
+        response.raise_for_status() # Raises an exception for bad status codes (4xx or 5xx)
+        
+        pin_data = response.json()
+        pin_id = pin_data['id']
+        pin_code = pin_data['code']
+        
+        print(">>> Success! Received PIN details from Plex.")
     except requests.exceptions.RequestException as e:
         print(f"\n--- ERROR ---")
-        print(f"An error occurred during the request: {e}")
-        print("Please check your network connection and try again.")
+        print(f"Could not connect to Plex to get a PIN: {e}")
         return
 
-    print(">>> Response received.")
-    input("Press Enter to view the server response...")
-
-    print(f"\nResponse Status Code: {response.status_code}")
-    print("Response Body:")
+    # 2. Construct the authentication URL and instruct the user
+    print("\nSTEP 2: Authorize the script in your browser.")
+    
+    auth_url = (
+        f"https://app.plex.tv/auth#?context%5Bdevice%5D%5Bproduct%5D={product_name}"
+        f"&clientID={client_identifier}"
+        f"&code={pin_code}"
+    )
+    
+    print("\nPlease open the following URL in your web browser to sign in:")
+    print(f"\n    {auth_url}\n")
+    print("After you sign in and see the 'You're all set!' message, please return to this window.")
+    
     try:
-        response_json = response.json()
-        print(json.dumps(response_json, indent=2))
-    except json.JSONDecodeError:
-        print("Could not decode JSON response. Raw response text:")
-        print(response.text)
-
+        webbrowser.open(auth_url)
+        print("Your default web browser has been opened. If it hasn't, please copy the URL manually.")
+    except webbrowser.Error:
+        print("Could not automatically open a web browser. Please copy the URL above and paste it into your browser.")
+        
     print("-" * 50)
+    print("STEP 3: Waiting for you to complete authentication...")
 
-    # 3. Handle response - check for success or 2FA requirement
+    # 3. Poll the PIN ID to see if it has been authorized
+    start_time = time.time()
     final_token = None
-    if response.status_code == 201: # Success
-        print("Authentication successful!")
-        final_token = response.json().get("user", {}).get("authentication_token")
-    elif response.status_code == 401 and "two-factor" in response.text: # 2FA required
-        print("STEP 2: Two-Factor Authentication (2FA) is required.")
-        mfa_code = input("Please enter your 6-digit 2FA code: ")
-
-        # Add the 2FA code to the headers for the next request
-        mfa_headers = PLEX_HEADERS.copy()
-        mfa_headers["X-Plex-Token"] = mfa_code.strip()
-
-        print("\nPreparing second authentication attempt with 2FA code...")
-        input("Press Enter to continue...")
-        print("-" * 50)
-
-        print(f"POST Request URL: {SIGN_IN_URL}")
-        print("Request Headers (with 2FA token):")
-        print(json.dumps(mfa_headers, indent=2))
-        print("Request Payload:")
-        print(json.dumps(masked_payload, indent=2))
-        print("\n>>> Sending request...")
-
+    
+    # Poll for a maximum of 3 minutes
+    while time.time() - start_time < 180:
         try:
-            mfa_response = requests.post(SIGN_IN_URL, headers=mfa_headers, json=payload)
+            print("Checking authentication status...")
+            check_url = f"{pins_url}/{pin_id}"
+            response = requests.get(check_url, headers=base_headers)
+            response.raise_for_status()
+            
+            auth_check_data = response.json()
+            if auth_check_data.get('authToken'):
+                final_token = auth_check_data['authToken']
+                print(">>> Success! Authentication token has been retrieved.")
+                break
+            
+            # Wait 5 seconds before checking again
+            time.sleep(5)
+            
         except requests.exceptions.RequestException as e:
-            print(f"\n--- ERROR ---")
-            print(f"An error occurred during the request: {e}")
+            print(f"\nAn error occurred while checking the token: {e}")
+            print("Aborting.")
             return
 
-        print(">>> Response received.")
-        input("Press Enter to view the server response...")
-
-        print(f"\nResponse Status Code: {mfa_response.status_code}")
-        print("Response Body:")
-        try:
-            print(json.dumps(mfa_response.json(), indent=2))
-        except json.JSONDecodeError:
-            print("Could not decode JSON response. Raw response text:")
-            print(mfa_response.text)
-
-        print("-" * 50)
-
-        if mfa_response.status_code == 201:
-            print("2FA Authentication successful!")
-            final_token = mfa_response.json().get("user", {}).get("authentication_token")
-        else:
-            print("--- AUTHENTICATION FAILED ---")
-            print("Could not authenticate, even with the 2FA code.")
-            print("Please run the script again.")
-            final_token = None
-    else:
-        print("--- AUTHENTICATION FAILED ---")
-        print("Received an unexpected server response. Please check your credentials and run the script again.")
-        final_token = None
-
     # 4. Final output
+    print("-" * 50)
     if final_token:
         print("\n\n" + "="*60)
         print("=== SUCCESS! Your Plex Access Token has been retrieved. ===")
@@ -141,7 +104,9 @@ def get_plex_token():
         print("Copy this token and paste it into your bot_config.ini file for the 'plex_token' value.")
         print("="*60)
     else:
-        print("\n\nCould not retrieve the Plex token. Please try again.")
+        print("\n\n--- AUTHENTICATION FAILED ---")
+        print("The script timed out waiting for authentication.")
+        print("Please run the script again to get a new link.")
 
 # This block ensures the get_plex_token() function is called when the script is executed.
 if __name__ == "__main__":
