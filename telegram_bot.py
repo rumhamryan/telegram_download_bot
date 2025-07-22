@@ -920,7 +920,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
         current_time = time.monotonic()
         if current_time - last_update_time > 5:
             last_update_time = current_time
-
             name_str = ""
             if parsed_info.get('type') == 'tv':
                 show_title = parsed_info.get('title', 'Unknown Show')
@@ -975,8 +974,9 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 
                 if target_file_path_in_torrent:
                     final_filename = generate_plex_filename(parsed_info, original_extension)
-                    
                     destination_directory = base_save_path
+                    
+                    # --- NEW: Intelligent Directory Finding Logic for TV Shows ---
                     if parsed_info.get('type') == 'tv':
                         show_title = parsed_info.get('title', 'Unknown Show')
                         season_num = parsed_info.get('season', 0)
@@ -984,12 +984,26 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                         invalid_chars = r'<>:"/\|?*'
                         safe_show_title = "".join(c for c in show_title if c not in invalid_chars)
 
-                        destination_directory = os.path.join(
-                            base_save_path, 
-                            safe_show_title, 
-                            f"Season {season_num:02d}"
-                        )
-                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] TV Show detected. Target directory set to: {destination_directory}")
+                        show_directory = os.path.join(base_save_path, safe_show_title)
+                        os.makedirs(show_directory, exist_ok=True)
+
+                        season_prefix = f"Season {season_num:02d}"
+                        found_season_dir = None
+                        try:
+                            for item in os.listdir(show_directory):
+                                if os.path.isdir(os.path.join(show_directory, item)) and item.startswith(season_prefix):
+                                    found_season_dir = os.path.join(show_directory, item)
+                                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Found existing season directory: '{found_season_dir}'")
+                                    break
+                        except OSError as e:
+                             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Could not scan for season directory: {e}")
+                        
+                        if found_season_dir:
+                            destination_directory = found_season_dir
+                        else:
+                            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] No existing directory found for '{season_prefix}'. Creating new one.")
+                            destination_directory = os.path.join(show_directory, season_prefix)
+                    # --- END of new logic ---
 
                     os.makedirs(destination_directory, exist_ok=True)
                     
@@ -1011,7 +1025,6 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                         if library_name:
                             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PLEX] Attempting to scan '{library_name}' library...")
                             try:
-                                # Run blocking Plex call in a separate thread
                                 plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
                                 target_library = await asyncio.to_thread(plex.library.section, library_name)
                                 await asyncio.to_thread(target_library.update)
