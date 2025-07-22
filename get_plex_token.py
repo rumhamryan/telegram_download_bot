@@ -1,19 +1,8 @@
 import requests
-import getpass
 import json
 import uuid
 
-# --- Configuration ---
-# These headers are required for all Plex API requests.
-# The product name is what will appear in the user's Plex dashboard under "Authorized Devices".
-PLEX_HEADERS = {
-    "X-Plex-Product": "Plex Telegram Bot Setup",
-    "X-Plex-Version": "1.0",
-    "X-Plex-Platform": "Python",
-    "accept": "application/json",
-}
-
-SIGN_IN_URL = "https://plex.tv/users/sign_in.json"
+# Note: 'getpass' is no longer imported as it is not used.
 
 def get_plex_token():
     """
@@ -21,16 +10,24 @@ def get_plex_token():
     handling 2FA if necessary.
     """
     client_identifier = str(uuid.uuid4())
-    PLEX_HEADERS["X-Plex-Client-Identifier"] = client_identifier
+    PLEX_HEADERS = {
+        "X-Plex-Product": "Plex Telegram Bot Setup",
+        "X-Plex-Version": "1.0",
+        "X-Plex-Platform": "Python",
+        "accept": "application/json",
+        "X-Plex-Client-Identifier": client_identifier,
+    }
+    SIGN_IN_URL = "https://plex.tv/users/sign_in.json"
+
 
     print("--- Plex Token Retrieval Script ---")
     print(f"This script will guide you through retrieving your Plex access token.")
     print(f"A unique Client Identifier has been generated for this session: {client_identifier}")
     print("---------------------------------------\n")
 
-    # 1. Securely get user credentials
+    # 1. Get user credentials (password is now visible on input)
     username = input("Please enter your Plex username or email: ")
-    password = getpass.getpass("Please enter your Plex password: ")
+    password = input("Please enter your Plex password: ")
     print("\nCredentials received. Preparing first authentication attempt...")
     input("Press Enter to continue...")
     print("-" * 50)
@@ -47,14 +44,14 @@ def get_plex_token():
     print(f"POST Request URL: {SIGN_IN_URL}")
     print("Request Headers:")
     print(json.dumps(PLEX_HEADERS, indent=2))
-    
-    # Mask password for security
+
+    # Mask password for security in the log output
     masked_payload = payload.copy()
     masked_payload['user']['password'] = '********'
     print("Request Payload:")
     print(json.dumps(masked_payload, indent=2))
     print("\n>>> Sending request...")
-    
+
     try:
         response = requests.post(SIGN_IN_URL, headers=PLEX_HEADERS, json=payload)
     except requests.exceptions.RequestException as e:
@@ -74,10 +71,11 @@ def get_plex_token():
     except json.JSONDecodeError:
         print("Could not decode JSON response. Raw response text:")
         print(response.text)
-    
+
     print("-" * 50)
 
     # 3. Handle response - check for success or 2FA requirement
+    final_token = None
     if response.status_code == 201: # Success
         print("Authentication successful!")
         final_token = response.json().get("user", {}).get("authentication_token")
@@ -88,12 +86,12 @@ def get_plex_token():
         # Add the 2FA code to the headers for the next request
         mfa_headers = PLEX_HEADERS.copy()
         mfa_headers["X-Plex-Token"] = mfa_code.strip()
-        
+
         print("\nPreparing second authentication attempt with 2FA code...")
         input("Press Enter to continue...")
         print("-" * 50)
-        
-        print("POST Request URL: {SIGN_IN_URL}")
+
+        print(f"POST Request URL: {SIGN_IN_URL}")
         print("Request Headers (with 2FA token):")
         print(json.dumps(mfa_headers, indent=2))
         print("Request Payload:")
@@ -106,7 +104,7 @@ def get_plex_token():
             print(f"\n--- ERROR ---")
             print(f"An error occurred during the request: {e}")
             return
-            
+
         print(">>> Response received.")
         input("Press Enter to view the server response...")
 
@@ -117,7 +115,7 @@ def get_plex_token():
         except json.JSONDecodeError:
             print("Could not decode JSON response. Raw response text:")
             print(mfa_response.text)
-        
+
         print("-" * 50)
 
         if mfa_response.status_code == 201:
@@ -144,6 +142,3 @@ def get_plex_token():
         print("="*60)
     else:
         print("\n\nCould not retrieve the Plex token. Please try again.")
-
-if __name__ == "__main__":
-    get_plex_token()
