@@ -14,14 +14,14 @@ import re
 import configparser
 import sys
 import math
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 import shutil
 
 from plexapi.server import PlexServer
 from plexapi.exceptions import NotFound, Unauthorized
 
 from telegram import Update, Message, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, ApplicationBuilder, CallbackContext, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 import libtorrent as lt
@@ -310,16 +310,19 @@ async def _parse_embedded_episode_page(soup: BeautifulSoup, season: int, episode
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WIKI] Fallback Strategy failed.")
     return None
 
-async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Optional[str]:
+async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episode: int) -> Tuple[Optional[str], Optional[str]]:
     """
-    (Coordinator)
-    Fetches an episode title from Wikipedia by trying a primary strategy for
-    dedicated pages, followed by a fallback strategy for embedded lists.
+    (Coordinator - MODIFIED)
+    Fetches an episode title from Wikipedia.
+    Returns a tuple: (episode_title, corrected_show_title).
+    'corrected_show_title' will be the new name if a redirect occurred on fallback,
+    otherwise it will be None.
     """
     html_to_scrape = None
+    corrected_show_title: Optional[str] = None
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # --- Step 1: Find the correct Wikipedia page (using proven async logic) ---
+    # --- Step 1: Find the correct Wikipedia page ---
     try:
         direct_search_query = f"List of {show_title} episodes"
         print(f"[{ts}] [INFO] Attempting to find dedicated episode page: '{direct_search_query}'")
@@ -327,42 +330,48 @@ async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episo
             wikipedia.page, direct_search_query, auto_suggest=False, redirect=True
         )
         html_to_scrape = await asyncio.to_thread(page.html)
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found dedicated episode page.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found dedicated episode page with original title.")
     
     except wikipedia.exceptions.PageError:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] No dedicated page found. Falling back to main show page search.")
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] No dedicated page found. Falling back to main show page search for '{show_title}'.")
         try:
             main_page = await asyncio.to_thread(
                 wikipedia.page, show_title, auto_suggest=True, redirect=True
             )
             html_to_scrape = await asyncio.to_thread(main_page.html)
-            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found main show page.")
+            
+            # --- KEY CHANGE: Check for and store a corrected title ---
+            if main_page.title != show_title:
+                corrected_show_title = main_page.title
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Fallback successful. Show title was corrected: '{show_title}' -> '{corrected_show_title}'")
+            else:
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found main show page with original title.")
+            # --- END OF KEY CHANGE ---
+
         except Exception as e:
             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An unexpected error occurred during fallback page search: {e}")
-            return None
+            return None, None
             
     except Exception as e:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] An unexpected error occurred during direct Wikipedia search: {e}")
-        return None
+        return None, None
 
     if not html_to_scrape:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] All page search attempts failed.")
-        return None
+        return None, None
 
     # --- Step 2: Orchestrate the parsing strategies ---
     soup = BeautifulSoup(html_to_scrape, 'lxml')
     
-    # Attempt the primary strategy first.
-    title = await _parse_dedicated_episode_page(soup, season, episode)
+    episode_title = await _parse_dedicated_episode_page(soup, season, episode)
     
-    # If the primary strategy fails, attempt the fallback.
-    if not title:
-        title = await _parse_embedded_episode_page(soup, season, episode)
+    if not episode_title:
+        episode_title = await _parse_embedded_episode_page(soup, season, episode)
 
-    if not title:
+    if not episode_title:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Both parsing strategies failed to find S{season:02d}E{episode:02d}.")
 
-    return title
+    return episode_title, corrected_show_title
 
 def get_dominant_file_type(files: lt.file_storage) -> str: # type: ignore
     if files.num_files() == 0: return "N/A"
@@ -622,11 +631,41 @@ async def post_shutdown(application: Application):
 
 # --- BOT HANDLER FUNCTIONS ---
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_user_authorized(update, context):
+from telegram import Update
+from telegram.ext import CallbackContext
+
+# ... (other imports and your existing bot code) ...
+
+async def start_command(update: Update, context: CallbackContext) -> None:
+    """Sends a message with instructions and torrent site links when the /start command is issued."""
+    # Ensure update.message is not None before trying to use it.
+    # This check satisfies the type checker and adds robustness.
+    if update.message is None:
+        # In this specific context (CommandHandler for /start), this case is highly unlikely,
+        # but adding it makes the type checker happy and provides a fallback.
+        if update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Hello! Please send /start again." # A simpler fallback
+            )
         return
-    if not update.message: return
-    await update.message.reply_text("Hello! Send me a direct URL to a .torrent file or a magnet link to begin.")
+
+    welcome_message = """
+Send me a .torrent or .magnet link!
+
+For Movies:
+https://yts.mx/
+https://1337x.to/
+https://thepiratebay.org/
+
+For TV Shows:
+https://eztvx.to/
+https://1337x.to/
+"""
+    await update.message.reply_text(welcome_message)
+
+# You would then register this handler in your main bot setup, for example:
+# application.add_handler(CommandHandler("start", start))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
@@ -728,7 +767,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
-    # --- ADDED: Log that a link has been received and is being processed ---
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Received link from chat_id {chat_id}. Starting analysis.")
 
     progress_message = await update.message.reply_text("✅ Input received. Analyzing...")
@@ -744,7 +782,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ti = await fetch_metadata_from_magnet(text, progress_message, context)
         
         if not ti:
-            return # The fetch function already sent the error message
+            return
 
     elif text.startswith(('http://', 'https://')) and text.endswith('.torrent'):
         source_type = 'file'
@@ -803,12 +841,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif parsed_info['type'] == 'tv':
         await progress_message.edit_text("📺 TV show detected. Searching Wikipedia for episode title...")
         
-        episode_title = await fetch_episode_title_from_wikipedia(
+        # --- MODIFIED: Handle the new return tuple ---
+        episode_title, corrected_show_title = await fetch_episode_title_from_wikipedia(
             show_title=parsed_info['title'],
             season=parsed_info['season'],
             episode=parsed_info['episode']
         )
         parsed_info['episode_title'] = episode_title
+
+        # If the Wikipedia search returned a corrected title, update our records.
+        if corrected_show_title:
+            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{ts}] [INFO] Updating show title in 'parsed_info' to reflect Wikipedia match: '{corrected_show_title}'")
+            parsed_info['title'] = corrected_show_title
+        # --- END OF MODIFICATION ---
         
         base_name = f"{parsed_info['title']} - S{parsed_info['season']:02d}E{parsed_info['episode']:02d}"
         display_name = f"{base_name} - {episode_title}" if episode_title else base_name
@@ -1143,6 +1189,7 @@ async def download_task_wrapper(download_data: Dict, application: Application):
                 print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Could not perform .parts file cleanup: {e}")
 
 # --- MAIN SCRIPT EXECUTION ---
+# --- MAIN SCRIPT EXECUTION ---
 if __name__ == '__main__':
     PERSISTENCE_FILE = 'persistence.json'
 
@@ -1175,11 +1222,21 @@ if __name__ == '__main__':
         'dht_bootstrap_nodes': 'router.utorrent.com:6881,router.bittorrent.com:6881,dht.transmissionbt.com:6881'
     })
     
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CommandHandler("plexstatus", plex_status_command))
+    # --- MODIFIED: Replaced CommandHandlers with MessageHandlers for flexibility ---
+    # This allows users to type commands with or without the leading '/'.
+    # The regex '^(?i)/?command$' matches 'command', '/command', 'Command', etc.
+    # The order is crucial: these specific handlers are added BEFORE the generic one.
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?hello$', re.IGNORECASE)), start_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?start$', re.IGNORECASE)), start_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?help$', re.IGNORECASE)), help_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?cancel$', re.IGNORECASE)), cancel_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?plexstatus$', re.IGNORECASE)), plex_status_command))
+    
+    # This generic handler for links/magnets now correctly comes after the specific command
+    # handlers and will not be triggered by command words.
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # This handler for button presses is unaffected.
     application.add_handler(CallbackQueryHandler(button_handler))
     
     application.run_polling()
