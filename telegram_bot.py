@@ -670,10 +670,25 @@ https://1337x.to/
 # application.add_handler(CommandHandler("start", start))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Provides a formatted list of available commands."""
     if not await is_user_authorized(update, context):
         return
     if not update.message: return
-    await update.message.reply_text("Send a URL ending in .torrent or a magnet link to start a download.\nUse /cancel to stop your current download.")
+    
+    # Using MarkdownV2 for nice formatting.
+    # Note that special characters like '.', '-', and '!' must be escaped with a '\'.
+    help_text = (
+        "Here are the available commands:\n\n"
+        "`start` \- Show welcome message\.\n"
+        "`cancel` \- Stop download\.\n"
+        "`plexstatus` \- Check Plex\.\n"
+        "`plexrestart` \- Restart Plex\.\n\n"
+    )
+    
+    await update.message.reply_text(
+        text=help_text,
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
@@ -769,30 +784,41 @@ async def plex_restart_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     status_message = await update.message.reply_text("Plex Restart: 🟡 Sending restart command to the server...")
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    script_path = os.path.abspath("restart_plex.sh")
+
+    if not os.path.exists(script_path):
+        print(f"[{ts}] [PLEX RESTART] ERROR: Wrapper script not found at {script_path}")
+        await status_message.edit_text("❌ *Error:* The `restart_plex.sh` script was not found in the bot's directory.")
+        return
     
     # The command to run, assuming sudoers is pre-configured
-    command = ["sudo", "systemctl", "restart", "plexmediaserver.service"]
+    command = ["/usr/bin/sudo", script_path]
 
     try:
-        print(f"[{ts}] [PLEX RESTART] Running local command: {' '.join(command)}")
+        # Get the absolute path to the script, assuming it's in the same directory as the bot.
+        script_path = os.path.abspath("restart_plex.sh")
         
-        # Run the blocking subprocess call in a separate thread
+        if not os.path.exists(script_path):
+            await status_message.edit_text("❌ *Error:* `restart_plex.sh` not found in the bot's directory.")
+            return
+
+        command = ["/usr/bin/sudo", script_path]
+
+        print(f"[{ts}] [PLEX RESTART] Executing wrapper script: {' '.join(command)}")
+        
         result = await asyncio.to_thread(
             subprocess.run, command, check=True, capture_output=True, text=True
         )
 
-        success_message = "✅ *Plex Restart Successful*\n\nThe restart command was executed and completed without errors\\."
-        print(f"[{ts}] [PLEX RESTART] Command finished successfully. Output:\n{result.stdout or '[No output]'}")
+        success_message = "✅ *Plex Restart Successful*"
         await status_message.edit_text(success_message, parse_mode=ParseMode.MARKDOWN_V2)
+        print(f"[{ts}] [PLEX RESTART] Success!")
 
     except subprocess.CalledProcessError as e:
         error_output = e.stderr or e.stdout
-        error_text = f"❌ *Command Failed*\n\nThe command returned an error\\. This often means the `sudoers` file is not configured correctly or the `plexmediaserver\\.service` is not found\\.\n\n*Details:*\n`{escape_markdown(error_output)}`"
-        print(f"[{ts}] [PLEX RESTART] ERROR executing command: {error_output}")
-        await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
-    except FileNotFoundError:
-        error_text = "❌ *Command Failed*\n\nCould not find the `sudo` or `systemctl` command\\. Please check the system's `PATH` environment variable\\."
-        print(f"[{ts}] [PLEX RESTART] ERROR: Command not found.")
+        error_text = f"❌ *Script Failed*\n\nThis almost always means the `sudoers` rule for `restart_plex.sh` is incorrect or missing\\.\n\n*Details:*\n`{escape_markdown(error_output)}`"
+        print(f"[{ts}] [PLEX RESTART] ERROR executing script: {error_output}")
         await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as e:
         error_text = f"❌ *An Unexpected Error Occurred*\n\n`{escape_markdown(str(e))}`"
