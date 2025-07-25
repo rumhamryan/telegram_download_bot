@@ -2,7 +2,7 @@
 
 import datetime
 import wikipedia
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from bs4.element import Tag
 import asyncio
 import httpx
@@ -452,7 +452,7 @@ def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[byte
     
     except Exception as e:
         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        print(f"[{ts}] [ERROR] An exception occurred in the metadata worker thread: {e}")
+        print(f"[{ts}] [ERROR] An exceptio`n occurred in the metadata worker thread: {e}")
 
     # This part is reached on timeout or error
     if 'handle' in locals() and handle.is_valid(): #type: ignore
@@ -829,10 +829,49 @@ async def plex_restart_command(update: Update, context: ContextTypes.DEFAULT_TYP
         print(f"[{ts}] [PLEX RESTART] ERROR: {str(e)}")
         await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
 
+async def find_magnet_link_on_page(url: str) -> Optional[str]:
+    """
+    Fetches a web page and attempts to find the first magnet link (href starting with 'magnet:').
+    """
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            print(f"[{ts}] [WEBSCRAPE] Fetching URL: {url}")
+            response = await client.get(url, follow_redirects=True)
+            response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+
+        soup = BeautifulSoup(response.text, 'lxml')
+
+        # Look for any <a> tag with an href starting with 'magnet:'
+        magnet_link_tag = soup.find('a', href=re.compile(r'^magnet:'))
+
+        # Explicitly check if it's a Tag instance for type safety
+        if isinstance(magnet_link_tag, Tag):
+            # Use .get() as it returns None if the attribute doesn't exist, which is safer.
+            # Then, explicitly check if it's a string, as some attributes might return lists.
+            magnet_link = magnet_link_tag.get('href')
+            
+            if isinstance(magnet_link, str):
+                print(f"[{ts}] [WEBSCRAPE] Found magnet link: {magnet_link[:100]}...") # Log first 100 chars
+                return magnet_link
+            else:
+                print(f"[{ts}] [WEBSCRAPE] Found <a> tag but href attribute is not a string or is empty: {url}")
+                return None
+        else:
+            print(f"[{ts}] [WEBSCRAPE] No <a> tag with a magnet link found on page: {url}")
+            return None
+
+    except httpx.RequestError as e:
+        print(f"[{ts}] [WEBSCRAPE ERROR] HTTP Request failed for {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"[{ts}] [WEBSCRAPE ERROR] An unexpected error occurred during scraping {url}: {e}")
+        return None
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
-        
+
     if not update.message or not update.message.text: return
     chat_id = update.message.chat_id
     text = update.message.text.strip()
@@ -853,9 +892,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith('magnet:?xt=urn:btih:'):
         source_type = 'magnet'
         source_value = text
-        
+
         ti = await fetch_metadata_from_magnet(text, progress_message, context)
-        
+
         if not ti:
             return
 
@@ -867,7 +906,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response.raise_for_status()
             torrent_content = response.content
         except httpx.RequestError as e:
-            await progress_message.edit_text(rf"❌ *Error:* Failed to download from URL\." + f"\n`{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+            error_msg = f"Failed to download .torrent file from URL: {e}"
+            await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_msg)}", parse_mode=ParseMode.MARKDOWN_V2)
             return
 
         try:
@@ -875,7 +915,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_hash = str(ti.info_hashes().v1) #type: ignore
             torrents_dir = ".torrents"
             os.makedirs(torrents_dir, exist_ok=True)
-            
+
             source_value = os.path.join(torrents_dir, f"{info_hash}.torrent")
             with open(source_value, "wb") as f:
                 f.write(torrent_content)
@@ -885,8 +925,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Failed to parse .torrent file for chat_id {chat_id}.")
             await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
             return
+    elif text.startswith(('http://', 'https://')): # New branch for generic URLs
+        ts_scrape = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{ts_scrape}] [INFO] Attempting to scrape magnet link from provided URL: {text}")
+        await progress_message.edit_text(f"🌐 *Web Page Detected:*\nAttempting to find magnet link on:\n`{escape_markdown(text)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+        extracted_magnet_link = await find_magnet_link_on_page(text)
+
+        if extracted_magnet_link:
+            source_type = 'magnet'
+            source_value = extracted_magnet_link
+            print(f"[{ts_scrape}] [INFO] Successfully extracted magnet link. Proceeding with download via magnet.")
+
+            # Now that we have the magnet link, proceed as if it was entered directly
+            ti = await fetch_metadata_from_magnet(source_value, progress_message, context)
+            if not ti:
+                return # fetch_metadata_from_magnet already handles error message
+        else:
+            print(f"[{ts_scrape}] [ERROR] No magnet link found on the provided page or page not accessible.")
+            error_message_text = "The provided URL does not contain a magnet link, or the page could not be accessed."
+            await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
+            return
     else:
-        error_message_text = "This does not look like a valid .torrent URL or magnet link."
+        error_message_text = "This does not look like a valid .torrent URL, magnet link, or a web page containing a magnet link."
         await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
