@@ -429,7 +429,7 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
     """
     cancel_timer = asyncio.Event()
     timer_task = asyncio.create_task(
-        _update_fetch_timer(progress_message, 120, cancel_timer)
+        _update_fetch_timer(progress_message, 30, cancel_timer)
     )
 
     ses = context.bot_data["TORRENT_SESSION"]
@@ -448,7 +448,7 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
         return ti
     else:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
-        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded.", parse_mode=ParseMode.MARKDOWN_V2)
+        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link\\. It might be inactive or poorly seeded\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return None
     
 def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]: #type: ignore
