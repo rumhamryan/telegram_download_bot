@@ -13,8 +13,9 @@ import time
 import re
 import configparser
 import sys
+import urllib.parse
 import math
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 import shutil
 import subprocess
 import platform
@@ -829,81 +830,94 @@ async def plex_restart_command(update: Update, context: ContextTypes.DEFAULT_TYP
         print(f"[{ts}] [PLEX RESTART] ERROR: {str(e)}")
         await status_message.edit_text(error_text, parse_mode=ParseMode.MARKDOWN_V2)
 
-async def find_magnet_link_on_page(url: str) -> Optional[str]:
+async def find_magnet_link_on_page(url: str) -> List[str]:
     """
-    Fetches a web page and attempts to find the first magnet link (href starting with 'magnet:').
+    Fetches a web page and attempts to find all magnet links (href starting with 'magnet:').
+    Returns a list of found magnet links, or an empty list if none are found.
     """
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    found_magnet_links: List[str] = []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             print(f"[{ts}] [WEBSCRAPE] Fetching URL: {url}")
             response = await client.get(url, follow_redirects=True)
-            response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+            response.raise_for_status()
 
         soup = BeautifulSoup(response.text, 'lxml')
+        magnet_link_tags = soup.find_all('a', href=re.compile(r'^magnet:'))
 
-        # Look for any <a> tag with an href starting with 'magnet:'
-        magnet_link_tag = soup.find('a', href=re.compile(r'^magnet:'))
-
-        # Explicitly check if it's a Tag instance for type safety
-        if isinstance(magnet_link_tag, Tag):
-            # Use .get() as it returns None if the attribute doesn't exist, which is safer.
-            # Then, explicitly check if it's a string, as some attributes might return lists.
-            magnet_link = magnet_link_tag.get('href')
+        if magnet_link_tags:
+            for tag in magnet_link_tags:
+                if isinstance(tag, Tag):
+                    magnet_link = tag.get('href')
+                    if isinstance(magnet_link, str):
+                        found_magnet_links.append(magnet_link)
             
-            if isinstance(magnet_link, str):
-                print(f"[{ts}] [WEBSCRAPE] Found magnet link: {magnet_link[:100]}...") # Log first 100 chars
-                return magnet_link
+            if found_magnet_links:
+                print(f"[{ts}] [WEBSCRAPE] Found {len(found_magnet_links)} magnet link(s) on page: {url}")
+                # Log the first one found for brevity
+                print(f"[{ts}] [WEBSCRAPE] First magnet link: {found_magnet_links[0][:100]}...")
             else:
-                print(f"[{ts}] [WEBSCRAPE] Found <a> tag but href attribute is not a string or is empty: {url}")
-                return None
+                print(f"[{ts}] [WEBSCRAPE] No valid magnet links found after parsing tags on page: {url}")
         else:
-            print(f"[{ts}] [WEBSCRAPE] No <a> tag with a magnet link found on page: {url}")
-            return None
+            print(f"[{ts}] [WEBSCRITICAL] No <a> tags with magnet links found on page: {url}")
 
     except httpx.RequestError as e:
         print(f"[{ts}] [WEBSCRAPE ERROR] HTTP Request failed for {url}: {e}")
-        return None
     except Exception as e:
         print(f"[{ts}] [WEBSCRAPE ERROR] An unexpected error occurred during scraping {url}: {e}")
-        return None
+    
+    return found_magnet_links
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles incoming messages, processing magnet links, .torrent files,
+    or web pages containing magnet links.
+    """
     if not await is_user_authorized(update, context):
         return
-
+        
     if not update.message or not update.message.text: return
     chat_id = update.message.chat_id
     text = update.message.text.strip()
-    user_message_to_delete = update.message
+    user_message_to_delete = update.message # Reference to the original message for deletion
 
+    # --- FIX: Ensure context.user_data is a dictionary ---
+    if context.user_data is None:
+        context.user_data = {} # Initialize if it's None to prevent "Object of type 'None' is not subscriptable"
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] context.user_data was None and has been initialized.")
+
+    # Check if user already has an active download
     if str(chat_id) in context.bot_data.get('active_downloads', {}):
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Received link from chat_id {chat_id}. Starting analysis.")
 
+    # Send initial "Analyzing..." message
     progress_message = await update.message.reply_text("✅ Input received. Analyzing...")
 
     source_value: Optional[str] = None
     source_type: Optional[str] = None
-    ti: Optional[lt.torrent_info] = None #type: ignore
+    ti: Optional[lt.torrent_info] = None # type: ignore
 
+    # --- 1. Handle Direct Magnet Link ---
     if text.startswith('magnet:?xt=urn:btih:'):
         source_type = 'magnet'
         source_value = text
-
+        
         ti = await fetch_metadata_from_magnet(text, progress_message, context)
-
-        if not ti:
+        
+        if not ti: # If metadata fetching failed or timed out, an error message is already sent
             return
 
+    # --- 2. Handle Direct .torrent URL ---
     elif text.startswith(('http://', 'https://')) and text.endswith('.torrent'):
         source_type = 'file'
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(text, follow_redirects=True, timeout=30)
-                response.raise_for_status()
+                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             torrent_content = response.content
         except httpx.RequestError as e:
             error_msg = f"Failed to download .torrent file from URL: {e}"
@@ -911,11 +925,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            ti = lt.torrent_info(torrent_content) #type: ignore
-            info_hash = str(ti.info_hashes().v1) #type: ignore
+            ti = lt.torrent_info(torrent_content) # type: ignore
+            info_hash = str(ti.info_hashes().v1)  # type: ignore
             torrents_dir = ".torrents"
             os.makedirs(torrents_dir, exist_ok=True)
-
+            
+            # Persist .torrent file for restart recovery
             source_value = os.path.join(torrents_dir, f"{info_hash}.torrent")
             with open(source_value, "wb") as f:
                 f.write(torrent_content)
@@ -925,43 +940,103 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] Failed to parse .torrent file for chat_id {chat_id}.")
             await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
             return
-    elif text.startswith(('http://', 'https://')): # New branch for generic URLs
+            
+    # --- 3. Handle Generic HTTP/HTTPS URL (Web Scraping for Magnet Links) ---
+    elif text.startswith(('http://', 'https://')):
         ts_scrape = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{ts_scrape}] [INFO] Attempting to scrape magnet link from provided URL: {text}")
-        await progress_message.edit_text(f"🌐 *Web Page Detected:*\nAttempting to find magnet link on:\n`{escape_markdown(text)}`", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        # Escape the static part of the message containing parentheses
+        safe_message_part = escape_markdown("Attempting to find magnet link(s) on:")
+        await progress_message.edit_text(
+            f"🌐 *Web Page Detected:*\n{safe_message_part}\n`{escape_markdown(text)}`", 
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
 
-        extracted_magnet_link = await find_magnet_link_on_page(text)
+        extracted_magnet_links = await find_magnet_link_on_page(text)
 
-        if extracted_magnet_link:
+        if extracted_magnet_links:
+            # If multiple magnet links are found, present choices to the user
+            if len(extracted_magnet_links) > 1:
+                print(f"[{ts_scrape}] [INFO] Multiple magnet links found. Presenting choices to user.")
+                
+                # Store the full list of magnet links in user_data for later retrieval by button_handler
+                context.user_data['temp_magnet_choices'] = extracted_magnet_links
+                
+                choices_text = f"Found {len(extracted_magnet_links)} magnet links\\. Please select one to download:\n\n"
+                keyboard = []
+                for i, link in enumerate(extracted_magnet_links):
+                    # Try to extract the display name from the magnet link (dn= parameter)
+                    name_match = re.search(r'dn=([^&]+)', link)
+                    link_display_name = name_match.group(1) if name_match else f"Link {i+1}"
+                    
+                    # Decode URL-encoded characters for display (e.g., %20 to space)
+                    try:
+                        link_display_name = urllib.parse.unquote_plus(link_display_name)
+                    except Exception:
+                        pass # Ignore if decoding fails, use as is
+
+                    # Shorten display name if too long and escape it
+                    display_escaped_name = escape_markdown(link_display_name)
+                    if len(display_escaped_name) > 60: # Limit length for cleaner display
+                        display_escaped_name = display_escaped_name[:57] + "..."
+
+                    choices_text += f"*{i+1}\\.* `{display_escaped_name}`\n" # FIX: Escaped the dot
+                    # Create a button for each link with a unique callback_data
+                    keyboard.append([InlineKeyboardButton(f"Select {i+1}", callback_data=f"select_magnet_{i}")])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await progress_message.edit_text(
+                    choices_text, 
+                    reply_markup=reply_markup, 
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+                
+                # IMPORTANT: Exit here. The rest of the download process will be triggered
+                # by the `button_handler` once the user makes a selection.
+                return
+            
+            # If only one magnet link is found, proceed directly with it
             source_type = 'magnet'
-            source_value = extracted_magnet_link
-            print(f"[{ts_scrape}] [INFO] Successfully extracted magnet link. Proceeding with download via magnet.")
+            source_value = extracted_magnet_links[0] 
+            print(f"[{ts_scrape}] [INFO] Successfully extracted a single magnet link. Proceeding with download via magnet.")
 
-            # Now that we have the magnet link, proceed as if it was entered directly
             ti = await fetch_metadata_from_magnet(source_value, progress_message, context)
             if not ti:
                 return # fetch_metadata_from_magnet already handles error message
         else:
-            print(f"[{ts_scrape}] [ERROR] No magnet link found on the provided page or page not accessible.")
-            error_message_text = "The provided URL does not contain a magnet link, or the page could not be accessed."
+            # No magnet links found on the page
+            print(f"[{ts_scrape}] [ERROR] No magnet links found on the provided page or page not accessible.")
+            error_message_text = "The provided URL does not contain any magnet links, or the page could not be accessed."
             await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
             return
+    # --- End of Generic URL Handling ---
+
+    # --- Fallback for invalid input ---
     else:
         error_message_text = "This does not look like a valid .torrent URL, magnet link, or a web page containing a magnet link."
         await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
-    if not ti:
+    # At this point, `ti` should be populated for direct magnet/torrent inputs,
+    # or after a single magnet link was successfully scraped and processed.
+    # If control reached here via multi-magnet selection, this path would have exited.
+    if not ti: # This check handles cases where metadata fetch failed for direct inputs
         await progress_message.edit_text("❌ *Error:* Could not analyze the torrent content.", parse_mode=ParseMode.MARKDOWN_V2)
-        if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
+        # Clean up the .torrent file if it was downloaded but failed to parse/analyze
+        if source_type == 'file' and source_value and os.path.exists(source_value):
+            os.remove(source_value)
         return
 
+    # --- 4. Validate Torrent Size ---
     if ti.total_size() > MAX_TORRENT_SIZE_BYTES:
         error_msg = f"This torrent is *{format_bytes(ti.total_size())}*, which is larger than the *{MAX_TORRENT_SIZE_GB} GB* limit."
         await progress_message.edit_text(f"❌ *Size Limit Exceeded*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
         if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
 
+    # --- 5. Validate Torrent File Types ---
     validation_error = validate_torrent_files(ti)
     if validation_error:
         error_msg = f"This torrent {validation_error}"
@@ -969,6 +1044,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if source_type == 'file' and source_value and os.path.exists(source_value): os.remove(source_value)
         return
     
+    # --- 6. Parse Torrent Name and Fetch Metadata for TV Shows ---
     parsed_info = parse_torrent_name(ti.name())
     display_name = ""
 
@@ -976,11 +1052,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_name = f"{parsed_info['title']} ({parsed_info['year']})"
     
     elif parsed_info['type'] == 'tv':
+        # Update user message during Wikipedia lookup
+        wiki_search_msg = escape_markdown("TV show detected. Searching Wikipedia for episode title...")
+        await progress_message.edit_text(f"📺 {wiki_search_msg}", parse_mode=ParseMode.MARKDOWN_V2)
         
-        error_message_text = "TV show detected. Searching Wikipedia for episode title..."
-        await progress_message.edit_text(f"📺  {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
-        
-        # --- MODIFIED: Handle the new return tuple ---
         episode_title, corrected_show_title = await fetch_episode_title_from_wikipedia(
             show_title=parsed_info['title'],
             season=parsed_info['season'],
@@ -988,18 +1063,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         parsed_info['episode_title'] = episode_title
 
-        # If the Wikipedia search returned a corrected title, update our records.
+        # If Wikipedia returned a corrected show title (e.g., from a redirect)
         if corrected_show_title:
-            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"[{ts}] [INFO] Updating show title in 'parsed_info' to reflect Wikipedia match: '{corrected_show_title}'")
+            ts_wiki = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(f"[{ts_wiki}] [INFO] Updating show title in 'parsed_info' to reflect Wikipedia match: '{corrected_show_title}'")
             parsed_info['title'] = corrected_show_title
-        # --- END OF MODIFICATION ---
         
         base_name = f"{parsed_info['title']} - S{parsed_info['season']:02d}E{parsed_info['episode']:02d}"
         display_name = f"{base_name} - {episode_title}" if episode_title else base_name
-    else:
+    else: # 'unknown' type
         display_name = parsed_info['title']
 
+    # --- 7. Prepare Confirmation Message and Buttons ---
     file_type_str = get_dominant_file_type(ti.files())
     total_size_str = format_bytes(ti.total_size())
     
@@ -1020,6 +1095,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await progress_message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Sent confirmation prompt to chat_id {chat_id} for torrent '{display_name}'.")
 
+    # --- 8. Delete Original User Message (for clean UI) ---
     try:
         await user_message_to_delete.delete()
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Deleted original link message from user {chat_id}.")
@@ -1027,21 +1103,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "Message to delete not found" in str(e) or "not enough rights" in str(e):
             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] Could not delete user's message. Reason: {e}")
         else:
-            raise
+            raise # Re-raise if it's an unexpected BadRequest
 
-    if context.user_data is None:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ERROR] context.user_data was None for chat_id {chat_id}. Aborting operation.")
-        await progress_message.edit_text(r"❌ *Error:* Could not access user session data\. Please try again\.", parse_mode=ParseMode.MARKDOWN_V2)
-        if source_type == 'file' and source_value and os.path.exists(source_value):
-            os.remove(source_value)
-        return
-        
+    # --- 9. Store Pending Torrent Information for Button Handler ---
+    # This context.user_data is now guaranteed to be a dict by the initial fix.
     context.user_data['pending_torrent'] = {
         'type': source_type, 
-        'value': source_value, 
+        'value': source_value, # This is the actual magnet link or path to .torrent file
         'clean_name': display_name,
-        'parsed_info': parsed_info
+        'parsed_info': parsed_info,
+        'original_message_id': progress_message.message_id # Store the ID of the message to be updated
     }
+
+# ... (existing imports) ...
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
@@ -1057,22 +1131,144 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f"[{ts}] [INFO] Received button press from user {query.from_user.id}: '{query.data}'")
 
-    if not context.user_data or 'pending_torrent' not in context.user_data:
-        print(f"[{ts}] [WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired).")
+    # --- FIX: Ensure context.user_data is a dictionary at the very beginning ---
+    if context.user_data is None:
+        context.user_data = {}
+        print(f"[{ts}] [WARN] context.user_data was None in button_handler and has been initialized.")
+
+    # Handle magnet selection first
+    if query.data and query.data.startswith("select_magnet_"):
+        # Now, context.user_data is guaranteed to be a dict
+        if 'temp_magnet_choices' not in context.user_data:
+            print(f"[{ts}] [WARN] Magnet selection from user {query.from_user.id} ignored: No pending magnet choices (session expired).")
+            try:
+                await query.edit_message_text("This selection has expired. Please send the link again.")
+            except BadRequest as e:
+                if "Message is not modified" not in str(e): pass
+            return
+
+        selected_index = int(query.data.split('_')[2])
+        magnet_links = context.user_data.pop('temp_magnet_choices') # This should be fine
+
+        if 0 <= selected_index < len(magnet_links):
+            selected_magnet_link = magnet_links[selected_index]
+            print(f"[{ts}] [SUCCESS] User {query.from_user.id} selected magnet link {selected_index + 1}.")
+            
+            # Now, proceed with the download flow using the selected magnet link
+            source_value = selected_magnet_link
+            source_type = 'magnet' # Always magnet for these selections
+
+            # Inform the user that processing is starting
+            await query.edit_message_text(f"✅ Selected magnet link {selected_index + 1}. Analyzing...")
+
+            # Use the original message that contained the selection buttons for subsequent edits
+            ti = await fetch_metadata_from_magnet(source_value, message, context) 
+            
+            if not ti:
+                return # fetch_metadata_from_magnet already handled error message
+            
+            # --- START OF DUPLICATED LOGIC (from handle_message after initial parsing) ---
+            # This block processes the selected magnet link.
+            # It needs to set 'pending_torrent' for the subsequent 'confirm_download' to work.
+
+            if ti.total_size() > MAX_TORRENT_SIZE_BYTES:
+                error_msg = f"This torrent is *{format_bytes(ti.total_size())}*, which is larger than the *{MAX_TORRENT_SIZE_GB} GB* limit."
+                await message.edit_text(f"❌ *Size Limit Exceeded*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+
+            validation_error = validate_torrent_files(ti)
+            if validation_error:
+                error_msg = f"This torrent {validation_error}"
+                await message.edit_text(f"❌ *Unsupported File Type*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+            
+            parsed_info = parse_torrent_name(ti.name())
+            display_name = ""
+
+            if parsed_info['type'] == 'movie':
+                display_name = f"{parsed_info['title']} ({parsed_info['year']})"
+            
+            elif parsed_info['type'] == 'tv':
+                await message.edit_text(f"📺 {escape_markdown('TV show detected. Searching Wikipedia for episode title...')}", parse_mode=ParseMode.MARKDOWN_V2)
+                
+                episode_title, corrected_show_title = await fetch_episode_title_from_wikipedia(
+                    show_title=parsed_info['title'],
+                    season=parsed_info['season'],
+                    episode=parsed_info['episode']
+                )
+                parsed_info['episode_title'] = episode_title
+
+                if corrected_show_title:
+                    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"[{ts}] [INFO] Updating show title in 'parsed_info' to reflect Wikipedia match: '{corrected_show_title}'")
+                    parsed_info['title'] = corrected_show_title
+                
+                base_name = f"{parsed_info['title']} - S{parsed_info['season']:02d}E{parsed_info['episode']:02d}"
+                display_name = f"{base_name} - {episode_title}" if episode_title else base_name
+            else:
+                display_name = parsed_info['title']
+
+            file_type_str = get_dominant_file_type(ti.files())
+            total_size_str = format_bytes(ti.total_size())
+            
+            confirmation_text = (
+                f"✅ *Validation Passed*\n\n"
+                f"*Name:* {escape_markdown(display_name)}\n"
+                f"*File Type:* {escape_markdown(file_type_str)}\n"
+                f"*Size:* {escape_markdown(total_size_str)}\n\n"
+                f"Do you want to start this download?"
+            )
+
+            keyboard = [[
+                InlineKeyboardButton("✅ Confirm Download", callback_data="confirm_download"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation"),
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Edit the message where the selection buttons were to show the confirmation prompt
+            await message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+            print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Sent confirmation prompt to chat_id {message.chat_id} for torrent '{display_name}'.")
+            
+            # Store pending_torrent for final confirmation. This is critical.
+            context.user_data['pending_torrent'] = {
+                'type': source_type, 
+                'value': source_value, 
+                'clean_name': display_name,
+                'parsed_info': parsed_info,
+                'original_message_id': message.message_id # This message ID is now the one to update for download progress
+            }
+            # --- END OF DUPLICATED LOGIC ---
+
+        else:
+            print(f"[{ts}] [ERROR] Invalid magnet selection index: {selected_index}")
+            await query.edit_message_text("❌ Invalid selection. Please try again or send a new link.")
+        return # Important: exit after handling magnet selection
+
+    # --- This is the existing logic for "confirm_download" and "cancel_operation" buttons ---
+    # It must come *after* the `select_magnet_` handling because `select_magnet_` sets `pending_torrent`.
+    
+    # Check if a pending torrent exists for 'confirm_download'/'cancel_operation'
+    # This `if` statement is where the warning in the log originates.
+    # It should pass now that context.user_data is guaranteed to be a dict
+    # and `pending_torrent` is set by the `select_magnet_` block.
+    if 'pending_torrent' not in context.user_data: 
+        print(f"[{ts}] [WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired). This implies a missing `pending_torrent` after initial processing.")
         try:
             await query.edit_message_text("This action has expired. Please send the link again.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
         return
 
-    pending_torrent = context.user_data.pop('pending_torrent')
+    # If pending_torrent *is* in context.user_data, proceed
+    pending_torrent = context.user_data.pop('pending_torrent') # Pop it here so it's cleared for next operation
     
     if query.data == "confirm_download":
         print(f"[{ts}] [SUCCESS] Download confirmed by user {query.from_user.id}. Queuing download task.")
         try:
+            # Edit the message where the confirmation buttons were
             await query.edit_message_text("✅ Confirmation received. Your download has been queued.")
         except BadRequest as e:
-            if "Message is not modified" not in str(e): raise
+            if "Message is not modified" not in str(e): pass
 
         save_paths = context.bot_data["SAVE_PATHS"]
         parsed_info = pending_torrent.get('parsed_info', {})
@@ -1090,10 +1286,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_downloads = context.bot_data.get('active_downloads', {})
         
+        # Use message_id from pending_torrent, which was the message displaying options/confirmation
         download_data = {
             'source_dict': pending_torrent,
-            'chat_id': message.chat_id,
-            'message_id': message.message_id,
+            'chat_id': message.chat_id, # Use message.chat_id from the query
+            'message_id': pending_torrent['original_message_id'], # Use the stored message ID for status updates
             'save_path': final_save_path
         }
         
