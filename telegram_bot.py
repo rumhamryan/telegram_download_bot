@@ -15,7 +15,7 @@ import configparser
 import sys
 import urllib.parse
 import math
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Set
 import shutil
 import subprocess
 import platform
@@ -825,18 +825,23 @@ async def plex_restart_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def find_magnet_link_on_page(url: str) -> List[str]:
     """
-    Fetches a web page and attempts to find all magnet links (href starting with 'magnet:').
-    Returns a list of found magnet links, or an empty list if none are found.
+    Fetches a web page and attempts to find all unique magnet links (href starting with 'magnet:').
+    Returns a list of unique found magnet links, or an empty list if none are found.
     """
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    found_magnet_links: List[str] = []
+    
+    # --- MODIFIED: Use a set to store unique magnet links ---
+    unique_magnet_links: Set[str] = set() 
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             print(f"[{ts}] [WEBSCRAPE] Fetching URL: {url}")
             response = await client.get(url, follow_redirects=True)
-            response.raise_for_status()
+            response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
 
         soup = BeautifulSoup(response.text, 'lxml')
+
+        # Look for all <a> tags with an href starting with 'magnet:'
         magnet_link_tags = soup.find_all('a', href=re.compile(r'^magnet:'))
 
         if magnet_link_tags:
@@ -844,12 +849,14 @@ async def find_magnet_link_on_page(url: str) -> List[str]:
                 if isinstance(tag, Tag):
                     magnet_link = tag.get('href')
                     if isinstance(magnet_link, str):
-                        found_magnet_links.append(magnet_link)
+                        # --- MODIFIED: Add to set instead of list ---
+                        unique_magnet_links.add(magnet_link) 
             
-            if found_magnet_links:
-                print(f"[{ts}] [WEBSCRAPE] Found {len(found_magnet_links)} magnet link(s) on page: {url}")
-                # Log the first one found for brevity
-                print(f"[{ts}] [WEBSCRAPE] First magnet link: {found_magnet_links[0][:100]}...")
+            if unique_magnet_links:
+                print(f"[{ts}] [WEBSCRAPE] Found {len(unique_magnet_links)} unique magnet link(s) on page: {url}")
+                # Log the first one found (arbitrary order from set) for brevity
+                first_link = next(iter(unique_magnet_links)) # Get first element from set
+                print(f"[{ts}] [WEBSCRAPE] First unique magnet link: {first_link[:100]}...")
             else:
                 print(f"[{ts}] [WEBSCRAPE] No valid magnet links found after parsing tags on page: {url}")
         else:
@@ -860,7 +867,8 @@ async def find_magnet_link_on_page(url: str) -> List[str]:
     except Exception as e:
         print(f"[{ts}] [WEBSCRAPE ERROR] An unexpected error occurred during scraping {url}: {e}")
     
-    return found_magnet_links
+    # --- MODIFIED: Convert set back to a list before returning ---
+    return list(unique_magnet_links)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
