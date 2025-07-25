@@ -367,6 +367,17 @@ async def fetch_episode_title_from_wikipedia(show_title: str, season: int, episo
             if main_page.title != show_title:
                 corrected_show_title = main_page.title
                 print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Fallback successful. Show title was corrected: '{show_title}' -> '{corrected_show_title}'")
+                try:
+                    direct_search_query = f"List of {corrected_show_title} episodes"
+                    print(f"[{ts}] [INFO] Attempting to find dedicated episode page: '{direct_search_query}'")
+                    page = await asyncio.to_thread(
+                        wikipedia.page, direct_search_query, auto_suggest=False, redirect=True
+                    )
+                    html_to_scrape = await asyncio.to_thread(page.html)
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found dedicated episode page with original title.")
+                    
+                except wikipedia.exceptions.PageError:
+                    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] No dedicated page found. Falling back to main show page search for '{show_title}'.")
             else:
                 print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Successfully found main show page with original title.")
             # --- END OF KEY CHANGE ---
