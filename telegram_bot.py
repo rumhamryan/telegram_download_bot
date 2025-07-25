@@ -448,7 +448,8 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
         return ti
     else:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
-        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link\\. It might be inactive or poorly seeded\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        error_message_text = "Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded."
+        await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         return None
     
 def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]: #type: ignore
@@ -542,7 +543,8 @@ async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message
         return ti
     else:
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
-        await progress_message.edit_text("❌ *Error:* Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded.", parse_mode=ParseMode.MARKDOWN_V2)
+        error_message_text = "Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded."
+        await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         return None
 
 def validate_torrent_files(ti: lt.torrent_info) -> Optional[str]: # type: ignore
@@ -914,7 +916,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await progress_message.edit_text(r"❌ *Error:* The provided file is not a valid torrent\.", parse_mode=ParseMode.MARKDOWN_V2)
             return
     else:
-        await progress_message.edit_text("This does not look like a valid .torrent URL or magnet link.")
+        error_message_text = "This does not look like a valid .torrent URL or magnet link."
+        await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     if not ti:
@@ -942,7 +945,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_name = f"{parsed_info['title']} ({parsed_info['year']})"
     
     elif parsed_info['type'] == 'tv':
-        await progress_message.edit_text("📺 TV show detected. Searching Wikipedia for episode title...")
+        
+        error_message_text = "TV show detected. Searching Wikipedia for episode title..."
+        await progress_message.edit_text(f"📺  {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
         
         # --- MODIFIED: Handle the new return tuple ---
         episode_title, corrected_show_title = await fetch_episode_title_from_wikipedia(
