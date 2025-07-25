@@ -111,40 +111,33 @@ def parse_torrent_name(name: str) -> dict:
     # Normalize by replacing dots and underscores with spaces
     cleaned_name = re.sub(r'[\._]', ' ', name)
     
-    # --- TV Show Detection ---
-    # Patterns: S01E02, s01e02, 1x02, etc. Case-insensitive.
+    # --- TV Show Detection (unchanged) ---
     tv_match = re.search(r'(?i)\b(S(\d{1,2})E(\d{1,2})|(\d{1,2})x(\d{1,2}))\b', cleaned_name)
     if tv_match:
-        # The text before the season/episode marker is the title
         title = cleaned_name[:tv_match.start()].strip()
-        
-        # Extract season and episode from the correct regex capture groups
-        if tv_match.group(2) is not None: # Matched SXXEXX
+        if tv_match.group(2) is not None:
             season = int(tv_match.group(2))
             episode = int(tv_match.group(3))
-        else: # Matched XxXX
+        else:
             season = int(tv_match.group(4))
             episode = int(tv_match.group(5))
-            
-        # Clean up trailing characters from the title
         title = re.sub(r'[\s-]+$', '', title).strip()
-        
         return {'type': 'tv', 'title': title, 'season': season, 'episode': episode}
 
     # --- Movie Detection ---
-    # Pattern: A four-digit year (19xx or 20xx)
     year_match = re.search(r'\b(19\d{2}|20\d{2})\b', cleaned_name)
     if year_match:
         year = year_match.group(1)
-        # The text before the year is the title
         title = cleaned_name[:year_match.start()].strip()
         
-        # Clean up title by removing any surrounding brackets
-        title = re.sub(r'^\s*\(|\)\s*$', '', title).strip()
+        # --- FIX STARTS HERE ---
+        # Remove any trailing spaces, parentheses, or hyphens from the title
+        title = re.sub(r'[\s(\)-]+$', '', title).strip()
+        # --- FIX ENDS HERE ---
 
         return {'type': 'movie', 'title': title, 'year': year}
 
-    # --- Fallback for names that don't match movie/TV patterns ---
+    # --- Fallback for names that don't match movie/TV patterns (unchanged) ---
     tags_to_remove = [
         r'\[.*?\]', r'\(.*?\)',
         r'\b(1080p|720p|480p|x264|x265|hevc|BluRay|WEB-DL|AAC|DTS|HDTV|RM4k|CC|10bit|commentary|HeVK)\b'
