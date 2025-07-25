@@ -422,36 +422,6 @@ def format_bytes(size_bytes: int) -> str:
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
 
-async def fetch_metadata_from_magnet(magnet_link: str, progress_message: Message, context: ContextTypes.DEFAULT_TYPE) -> Optional[lt.torrent_info]: #type: ignore
-    """
-    (Coordinator) Fetches metadata by running the blocking libtorrent code in a
-    separate thread, while running a responsive UI timer in the main thread.
-    """
-    cancel_timer = asyncio.Event()
-    timer_task = asyncio.create_task(
-        _update_fetch_timer(progress_message, 30, cancel_timer)
-    )
-
-    ses = context.bot_data["TORRENT_SESSION"]
-    
-    # --- ADDED: Log that the thread is being spawned ---
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Spawning worker thread for metadata fetch.")
-    bencoded_metadata = await asyncio.to_thread(_blocking_fetch_metadata, ses, magnet_link)
-    
-    cancel_timer.set()
-    await timer_task
-
-    if bencoded_metadata:
-        # --- ADDED: Log that the thread returned successfully ---
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Worker thread returned successfully. Reconstructing torrent_info object.")
-        ti = lt.torrent_info(bencoded_metadata) #type: ignore
-        return ti
-    else:
-        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Metadata fetch failed or timed out.")
-        error_message_text = "Timed out fetching metadata from the magnet link. It might be inactive or poorly seeded."
-        await progress_message.edit_text(f"❌ *Error:* {escape_markdown(error_message_text)}", parse_mode=ParseMode.MARKDOWN_V2)
-        return None
-    
 def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[bytes]: #type: ignore
     """
     (PRODUCTION VERSION)
@@ -466,7 +436,7 @@ def _blocking_fetch_metadata(ses: lt.session, magnet_link: str) -> Optional[byte
         handle = ses.add_torrent(params)
 
         start_time = time.monotonic()
-        timeout_seconds = 120
+        timeout_seconds = 30
 
         while time.monotonic() - start_time < timeout_seconds:
             if handle.status().has_metadata:
