@@ -1162,7 +1162,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     or web pages containing magnet links.
     """
     ts_start = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] handle_message entered for chat_id {update.message.chat_id if update.message else 'N/A'}") # Added null check
+    # THIS IS THE NEW DEBUG LINE - IT SHOULD ALWAYS PRINT FOR TEXT MESSAGES
+    print(f"[{ts_start}] [DEBUG_ENTRY] handle_message has been called for text: '{update.message.text if update.message else 'N/A'}' from chat_id {update.message.chat_id if update.message else 'N/A'}")
+
 
     if not await is_user_authorized(update, context):
         print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] User not authorized. Exiting handle_message.")
@@ -1949,7 +1951,7 @@ if __name__ == '__main__':
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & waiting_for_delete_input_filter_instance, # FIX: Use the instantiated filter object
+            filters.TEXT & ~filters.COMMAND & waiting_for_delete_input_filter_instance, # Use the instantiated filter object
             handle_delete_input
         )
     )
