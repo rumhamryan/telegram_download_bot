@@ -721,6 +721,16 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_str = str(chat_id)
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # FIX START: Check and clear pending delete state
+    if context.user_data and context.user_data.get('waiting_for_delete_input', False):
+        context.user_data.pop('waiting_for_delete_input', None)
+        # Also clear any pending delete info if it exists
+        context.user_data.pop('pending_delete_info', None) 
+        print(f"[{ts}] [INFO] /cancel command received. Cleared pending delete state for chat_id {chat_id}.")
+        await update.message.reply_text("✅ Delete operation cancelled.")
+        return # Exit early if it was a delete cancellation
+    # FIX END
+
     if chat_id_str in active_downloads:
         download_data = active_downloads[chat_id_str]
         clean_name = download_data.get('source_dict', {}).get('clean_name', 'your download')
@@ -741,7 +751,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Found a record of your download, but the task is not running. It may be in a stalled state.")
     else:
         print(f"[{ts}] [INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
-        await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
+        # Only send this if no delete state was found either
+        # This re-check ensures we don't send two messages if the delete state was just cancelled.
+        if not (context.user_data and context.user_data.get('waiting_for_delete_input', False)): 
+            await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
