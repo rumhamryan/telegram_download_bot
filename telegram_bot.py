@@ -763,10 +763,17 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
+# file: telegram_bot.py
+
+# ... (other imports - ensure all necessary ones like os, shutil, re, datetime, typing, telegram, telegram.ext are present) ...
+
 async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Processes the user's input for the media title to be deleted,
     finds potential files, and asks for confirmation.
+    
+    This function sends messages to the user via Telegram's API (edit_text/reply_text)
+    and does not return any text value in Python.
     """
     if not await is_user_authorized(update, context):
         return
@@ -778,9 +785,9 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     # Ensure user_data is initialized and flag is set
+    # This handler must be placed AFTER specific command handlers but BEFORE the general handle_message
+    # in application.add_handler to ensure proper flow.
     if context.user_data is None or not context.user_data.get('waiting_for_delete_input'):
-        # If not waiting for delete input, this message is not for deletion.
-        # It's crucial this handler is registered BEFORE the generic handle_message.
         return 
 
     # Clear the flag immediately to prevent further inputs being treated as delete titles
@@ -795,14 +802,15 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     parsed_info = parse_torrent_name(user_input)
     media_type = parsed_info.get('type', 'unknown')
     
-    # --- NEW: Provide specific feedback if input format is not recognized ---
+    # --- Path 1: Provide specific feedback if input format is not recognized ---
     if media_type == 'unknown':
         print(f"[{ts}] [DELETE] Input '{user_input}' could not be classified as movie/TV. Prompting user for correct format.")
+        
         await processing_message.edit_text(
             f"❓ *Unrecognized Format:*\n\n"
-            f"I couldn't identify '{escape_markdown(user_input)}' as a specific movie or TV show using the expected format\\. "
-            f"Please ensure you include the year for movies (e\\.g\\., `Movie Title \\(2023\\)`) "
-            f"or the season and episode for TV shows (e\\.g\\., `TV Show Name S01E01`)\\.\n\n"
+            f"I couldn't identify '{escape_markdown(user_input)}' as a specific movie or TV show using the expected format\\.\n"
+            f"Please ensure you include the year for movies \\(e\\.g\\.\\, `Movie Title \\(2023\\)`\\) "
+            f"or the season and episode for TV shows \\(e\\.g\\.\\, `TV Show Name S01E01`\\)\\.\n\n"
             f"Send `/cancel` to stop this operation\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
@@ -829,54 +837,87 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         invalid_chars = r'<>:"/\|?*'
         safe_search_name = "".join(c for c in search_name if c not in invalid_chars)
         
-        # Regex to match the start of the filename (e.g., "Movie Title (2023)") and common video extensions
-        # This regex specifically targets files named by the bot's `generate_plex_filename`
-        # which uses "Title (Year).ext"
         expected_filename_regex = re.compile(rf"^{re.escape(safe_search_name)}\s*\.(mkv|mp4)$", re.IGNORECASE)
 
         print(f"[{ts}] [DELETE] Searching for movie pattern '{safe_search_name}' in '{movie_base_path}'")
+        
+        # --- Path 2a: Check if the configured movie path exists ---
+        if not os.path.exists(movie_base_path):
+            print(f"[{ts}] [DEBUG] Movie base path '{movie_base_path}' DOES NOT EXIST or is INACCESSIBLE according to os.path.exists().")
+            await processing_message.edit_text(
+                f"❌ *Error*: The movie directory `{escape_markdown(movie_base_path)}` is not found or accessible from the bot's environment\\.\n\n"
+                f"Please check your `config.ini` path for movies\\.",
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            try:
+                await update.message.delete()
+            except BadRequest: 
+                pass
+            return 
+
+        print(f"[{ts}] [DEBUG] Starting os.walk on existing path: {movie_base_path}")
+        found_any_files_in_walk = False 
         for root, _, files in os.walk(movie_base_path):
+            found_any_files_in_walk = True
+            print(f"[{ts}] [DEBUG] Currently walking in: {root}")
+            print(f"[{ts}] [DEBUG] Files found in '{root}': {files}") 
+
             for file in files:
+                print(f"[{ts}] [DEBUG] Checking file '{file}' against regex: '{expected_filename_regex.pattern}'")
                 if expected_filename_regex.match(file):
                     full_path = os.path.join(root, file)
-                    potential_files.append((f"Movie: {os.path.splitext(file)[0]}", full_path))
+                    # FIX: Correctly extract the filename without extension for display
+                    display_text = f"Movie: {os.path.splitext(file)[0]}" 
+                    potential_files.append((display_text, full_path))
                     print(f"[{ts}] [DELETE] Found potential movie file: {full_path}")
-                    
+        
+        if not found_any_files_in_walk:
+            print(f"[{ts}] [DEBUG] os.walk('{movie_base_path}') yielded no directories or files. Is the directory empty or inaccessible even if it exists?")
+
+
     # --- Search for TV Shows ---
     elif media_type == 'tv' and 'season' in parsed_info and 'episode' in parsed_info:
         show_title_raw = parsed_info['title']
         season_num = parsed_info['season']
         episode_num = parsed_info['episode']
 
-        # Sanitize show title for path comparison
         invalid_chars = r'<>:"/\|?*'
         safe_show_title = "".join(c for c in show_title_raw if c not in invalid_chars)
         
         tv_base_path = save_paths.get('tv_shows', save_paths['default'])
 
+        # --- Path 2b: Check if the configured TV show path exists ---
+        if not os.path.exists(tv_base_path):
+            print(f"[{ts}] [DEBUG] TV base path '{tv_base_path}' DOES NOT EXIST or is INACCESSIBLE according to os.path.exists().")
+            await processing_message.edit_text(
+                f"❌ *Error*: The TV show directory `{escape_markdown(tv_base_path)}` is not found or accessible from the bot's environment\\.\n\n"
+                f"Please check your `config.ini` path for TV shows\\.",
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            try:
+                await update.message.delete()
+            except BadRequest:
+                pass
+            return 
+
         season_padded = f"{season_num:02d}"
         episode_padded = f"{episode_num:02d}"
         
-        # Regex to match 'sXXeXX' in the filename and common video extensions
         episode_file_pattern = re.compile(rf"(?i)s{season_padded}e{episode_padded}.*\.(mkv|mp4)$")
 
         print(f"[{ts}] [DELETE] Searching for TV show '{safe_show_title}' and episode S{season_padded}E{episode_padded} in '{tv_base_path}'")
 
         for root, _, files in os.walk(tv_base_path):
-            # Check if the current path contains the show title and a season directory (case-insensitive)
-            # This attempts to match the typical Plex structure: /TV Shows/Show Name/Season XX/
-            path_segments = [s.lower() for s in root.replace('\\', '/').split('/')] # Normalize and lowercase path segments
+            path_segments = [s.lower() for s in root.replace('\\', '/').split('/')] 
             
             show_title_in_path = False
             season_dir_in_path = False
 
-            # Check for show title in path segments
             for segment in path_segments:
-                if safe_show_title.lower() in segment: # Use 'in' for more flexible match
+                if safe_show_title.lower() in segment: 
                     show_title_in_path = True
                     break
             
-            # Check for season directory in path segments (e.g., "Season 01", "Season 1")
             for segment in path_segments:
                 season_match = re.match(r'season\s*(\d{1,2})', segment)
                 if season_match and int(season_match.group(1)) == season_num:
@@ -887,22 +928,21 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 for file in files:
                     if episode_file_pattern.search(file):
                         full_path = os.path.join(root, file)
-                        # Construct a display name relative to the base path for clarity
                         try:
-                            # Use relpath for a more user-friendly display of the file location
-                            relative_display_name = os.path.relpath(full_path, tv_base_path)
-                            display_text = os.path.splitext(relative_display_name)[0]
-                        except ValueError: # Path error, e.g. file_path_to_delete not under tv_base_path
-                            display_text = os.path.splitext(os.path.basename(full_path))[0] # Fallback to just filename
+                            # FIX: Extract filename without extension for display
+                            relative_display_name_base = os.path.splitext(os.path.relpath(full_path, tv_base_path))[0]
+                            display_text = f"TV Show: {relative_display_name_base}"
+                        except ValueError: 
+                            # FIX: Fallback to just base filename without extension
+                            display_text = f"TV Show: {os.path.splitext(os.path.basename(full_path))[0]}" 
                             
-                        potential_files.append((f"TV Show: {display_text}", full_path))
+                        potential_files.append((display_text, full_path))
                         print(f"[{ts}] [DELETE] Found potential TV episode file: {full_path}")
 
-    # --- Confirmation Step ---
+    # --- Path 3: Confirmation Step ---
     if potential_files:
-        # If multiple files are found (e.g., different qualities of the same movie, or multiple episodes if regex was too broad)
         if len(potential_files) > 1:
-            reply_text = "⚠️ *Multiple potential files found!* Please be more specific with your title.\n\n"
+            reply_text = "⚠️ *Multiple potential files found\\!* Please be more specific with your title\\.\n\n"
             for i, (display_name, _) in enumerate(potential_files):
                 reply_text += f"*{i+1}\\.* `{escape_markdown(display_name)}`\n"
             reply_text += "\n" + escape_markdown("Please try again with a more exact name, or consider manual deletion if unsure.")
@@ -912,16 +952,16 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
-            # Do not store pending_delete_info if multiple ambiguous matches
             context.user_data['pending_delete_info'] = None 
         else:
-            # Only one potential file found, proceed to confirmation
-            display_name, abs_path = potential_files[0]
+            # FIX: Correctly unpack the single potential file from the list
+            display_name, abs_path = potential_files[0] 
+
             reply_text = (
                 f"🗑️ *Confirm Deletion:*\n\n"
-                f"Are you sure you want to delete this file?\n\n"
+                f"Are you sure you want to delete this file\\?\n\n"
                 f"File: `{escape_markdown(display_name)}`\n"
-                f"Path: `{escape_markdown(abs_path)}`\n\n"
+                f"Path: `{escape_markdown(abs_path)}`\n\n" # This line should now be fine as abs_path is definitely a string
                 f"*This action cannot be undone\\!*"
             )
             keyboard = [[
@@ -930,11 +970,11 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Store the file path and display name for the actual deletion step in button_handler
             context.user_data['pending_delete_info'] = {'path': abs_path, 'display_name': display_name}
             await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
 
-    else: # No files found after parsing input
+    # --- Path 4: No files found after parsing input ---
+    else: 
         print(f"[{ts}] [DELETE] No media found matching '{user_input}' (after parsing).")
         await processing_message.edit_text(
             f"❌ No media found matching `{escape_markdown(user_input)}` in your configured media directories\\.\n\n"
@@ -944,7 +984,7 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     
     # Delete the user's initial input message (if not already deleted by the 'unknown' path)
-    if update.message.message_id != processing_message.message_id: # Only delete if it's not the 'processing' message itself
+    if update.message.message_id != processing_message.message_id: 
         try:
             await update.message.delete()
             print(f"[{ts}] [DELETE] Deleted user's input message for deletion (final step).")
@@ -952,7 +992,7 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             if "Message to delete not found" in str(e) or "not enough rights" in str(e):
                 print(f"[{ts}] [WARN] Could not delete user's delete input message. Reason: {e}")
             else:
-                raise # Re-raise if it's an unexpected BadRequest
+                raise 
 
 async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Checks the connection to the Plex Media Server."""
