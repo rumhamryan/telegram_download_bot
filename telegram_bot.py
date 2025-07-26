@@ -778,10 +778,6 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
-# file: telegram_bot.py
-
-# ... (other imports - ensure all necessary ones like os, shutil, re, datetime, typing, telegram, telegram.ext are present) ...
-
 async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Processes the user's input for the media title to be deleted,
@@ -799,31 +795,33 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_input = update.message.text.strip()
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # Ensure user_data is initialized (defensive, filter should ensure this is true)
     if context.user_data is None:
         context.user_data = {}
 
-    # Clear the flag immediately to prevent further inputs being treated as delete titles
-    context.user_data.pop('waiting_for_delete_input', None)
+    # The filter (WaitingForDeleteInputFilter) ensures that we only enter this function
+    # if context.user_data['waiting_for_delete_input'] is True.
 
     print(f"[{ts}] [DELETE] Processing delete input from {chat_id}: '{user_input}'")
     
     processing_message = await update.message.reply_text("🔎 Searching for media to delete...")
 
-    # Use parse_torrent_name logic to guess media type from user input
-    # It will return type='unknown' if it doesn't find SXXEXX or (YEAR)
     parsed_info = parse_torrent_name(user_input)
     media_type = parsed_info.get('type', 'unknown')
     
-    # --- Path 1: Provide specific feedback if input format is not recognized ---
+    # --- Path 1: Input format for deletion is not recognized ---
     if media_type == 'unknown':
-        print(f"[{ts}] [DELETE] Input '{user_input}' could not be classified as movie/TV. Prompting user for correct format.")
+        print(f"[{ts}] [DELETE] Input '{user_input}' could not be classified as movie/TV for deletion.")
         
+        # IMPORTANT: Do NOT pop 'waiting_for_delete_input' here.
+        # The user is still in the 'delete input' state and needs to provide valid input.
+
         await processing_message.edit_text(
-            f"❓ *Unrecognized Format:*\n\n"
-            f"I couldn't identify '{escape_markdown(user_input)}' as a specific movie or TV show using the expected format\\.\n"
-            f"Please ensure you include the year for movies \\(e\\.g\\.\\, `Movie Title \\(2023\\)`\\) "
-            f"or the season and episode for TV shows \\(e\\.g\\.\\, `TV Show Name S01E01`\\)\\.\n\n"
-            f"Send `/cancel` to stop this operation\\.",
+            f"❓ *Invalid Delete Input Format:*\n\n"
+            f"I couldn't identify '{escape_markdown(user_input)}' as a movie or TV show title for deletion\\.\n"
+            f"Please ensure you provide the title in the correct format:\n"
+            f"`Movie Title \\(Year\\)` or `TV Show Name S01E01`\\.\n\n"
+            f"Send `/cancel` to stop the deletion process\\.",
             parse_mode=ParseMode.MARKDOWN_V2
         )
         # Delete the user's input message for tidiness
@@ -835,7 +833,10 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"[{ts}] [WARN] Could not delete user's delete input message. Reason: {e}")
             else:
                 raise # Re-raise if it's an unexpected BadRequest
-        return # Exit early if input format is not recognized
+        return # Exit early if input format is not recognized for deletion
+
+    # --- Only clear the flag if the input was successfully parsed as a movie or TV show ---
+    context.user_data.pop('waiting_for_delete_input', None) # Now it's safe to clear the flag
 
     potential_files: List[Tuple[str, str]] = [] # List of (display_name, absolute_path)
     save_paths = context.bot_data["SAVE_PATHS"]
@@ -845,7 +846,6 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         movie_base_path = save_paths.get('movies', save_paths['default'])
         search_name = f"{parsed_info['title']} ({parsed_info['year']})"
         
-        # Sanitize search name to match how Plex-friendly names are generated
         invalid_chars = r'<>:"/\|?*'
         safe_search_name = "".join(c for c in search_name if c not in invalid_chars)
         
@@ -853,7 +853,6 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         print(f"[{ts}] [DELETE] Searching for movie pattern '{safe_search_name}' in '{movie_base_path}'")
         
-        # --- Path 2a: Check if the configured movie path exists ---
         if not os.path.exists(movie_base_path):
             print(f"[{ts}] [DEBUG] Movie base path '{movie_base_path}' DOES NOT EXIST or is INACCESSIBLE according to os.path.exists().")
             await processing_message.edit_text(
@@ -878,7 +877,6 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"[{ts}] [DEBUG] Checking file '{file}' against regex: '{expected_filename_regex.pattern}'")
                 if expected_filename_regex.match(file):
                     full_path = os.path.join(root, file)
-                    # FIX: Correctly extract the filename without extension for display
                     display_text = f"Movie: {os.path.splitext(file)[0]}" 
                     potential_files.append((display_text, full_path))
                     print(f"[{ts}] [DELETE] Found potential movie file: {full_path}")
@@ -898,7 +896,6 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         tv_base_path = save_paths.get('tv_shows', save_paths['default'])
 
-        # --- Path 2b: Check if the configured TV show path exists ---
         if not os.path.exists(tv_base_path):
             print(f"[{ts}] [DEBUG] TV base path '{tv_base_path}' DOES NOT EXIST or is INACCESSIBLE according to os.path.exists().")
             await processing_message.edit_text(
@@ -941,11 +938,9 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                     if episode_file_pattern.search(file):
                         full_path = os.path.join(root, file)
                         try:
-                            # FIX: Extract filename without extension for display
                             relative_display_name_base = os.path.splitext(os.path.relpath(full_path, tv_base_path))[0]
                             display_text = f"TV Show: {relative_display_name_base}"
                         except ValueError: 
-                            # FIX: Fallback to just base filename without extension
                             display_text = f"TV Show: {os.path.splitext(os.path.basename(full_path))[0]}" 
                             
                         potential_files.append((display_text, full_path))
@@ -966,14 +961,13 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
             context.user_data['pending_delete_info'] = None 
         else:
-            # FIX: Correctly unpack the single potential file from the list
             display_name, abs_path = potential_files[0] 
 
             reply_text = (
                 f"🗑️ *Confirm Deletion:*\n\n"
                 f"Are you sure you want to delete this file\\?\n\n"
                 f"File: `{escape_markdown(display_name)}`\n"
-                f"Path: `{escape_markdown(abs_path)}`\n\n" # This line should now be fine as abs_path is definitely a string
+                f"Path: `{escape_markdown(abs_path)}`\n\n"
                 f"*This action cannot be undone\\!*"
             )
             keyboard = [[
@@ -985,9 +979,9 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data['pending_delete_info'] = {'path': abs_path, 'display_name': display_name}
             await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
 
-    # --- Path 4: No files found after parsing input ---
+    # --- Path 4: No files found after successful parsing ---
     else: 
-        print(f"[{ts}] [DELETE] No media found matching '{user_input}' (after parsing).")
+        print(f"[{ts}] [DELETE] No media found matching '{user_input}' (after parsing, but no files found).")
         await processing_message.edit_text(
             f"❌ No media found matching `{escape_markdown(user_input)}` in your configured media directories\\.\n\n"
             f"Please ensure the title is exact and the file is located within the bot's managed paths\\.\n"
