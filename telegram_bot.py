@@ -1403,14 +1403,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f"[{ts}] [INFO] Received button press from user {query.from_user.id}: '{query.data}'")
 
-    # --- FIX: Ensure context.user_data is a dictionary at the very beginning ---
     if context.user_data is None:
         context.user_data = {}
         print(f"[{ts}] [WARN] context.user_data was None in button_handler and has been initialized.")
 
-    # Handle magnet selection first
+    # --- 1. Handle magnet selection first ---
     if query.data and query.data.startswith("select_magnet_"):
-        # Now, context.user_data is guaranteed to be a dict
         if 'temp_magnet_choices' not in context.user_data:
             print(f"[{ts}] [WARN] Magnet selection from user {query.from_user.id} ignored: No pending magnet choices (session expired).")
             try:
@@ -1420,38 +1418,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         selected_index = int(query.data.split('_')[2])
-        magnet_links = context.user_data.pop('temp_magnet_choices') # This should be fine
+        magnet_links = context.user_data.pop('temp_magnet_choices') 
 
         if 0 <= selected_index < len(magnet_links):
-            selected_magnet_link = magnet_links[selected_index]
+            # FIX: Define source_type and source_value here
+            source_value = magnet_links[selected_index]
+            source_type = 'magnet' # For magnet selections, the type is always 'magnet'
+
             print(f"[{ts}] [SUCCESS] User {query.from_user.id} selected magnet link {selected_index + 1}.")
             
-            # Now, proceed with the download flow using the selected magnet link
-            source_value = selected_magnet_link
-            source_type = 'magnet' # Always magnet for these selections
-
-            # Inform the user that processing is starting
             await query.edit_message_text(f"✅ Selected magnet link {selected_index + 1}. Analyzing...")
 
-            # Use the original message that contained the selection buttons for subsequent edits
-            ti = await fetch_metadata_from_magnet(source_value, message, context) 
+            ti = await fetch_metadata_from_magnet(source_value, message, context) # Use source_value here
             
             if not ti:
-                return # fetch_metadata_from_magnet already handled error message
+                return 
             
-            # --- START OF DUPLICATED LOGIC (from handle_message after initial parsing) ---
-            # This block processes the selected magnet link.
-            # It needs to set 'pending_torrent' for the subsequent 'confirm_download' to work.
-
             if ti.total_size() > MAX_TORRENT_SIZE_BYTES:
                 error_msg = f"This torrent is *{format_bytes(ti.total_size())}*, which is larger than the *{MAX_TORRENT_SIZE_GB} GB* limit."
-                await message.edit_text(f"❌ *Size Limit Exceeded*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
+                await message.edit_text(f"❌ *Size Limit Exceeded*\n\n{escape_markdown(error_msg)}", parse_mode=ParseMode.MARKDOWN_V2) # Escaped error_msg
                 return
 
             validation_error = validate_torrent_files(ti)
             if validation_error:
                 error_msg = f"This torrent {validation_error}"
-                await message.edit_text(f"❌ *Unsupported File Type*\n\n{error_msg}", parse_mode=ParseMode.MARKDOWN_V2)
+                await message.edit_text(f"❌ *Unsupported File Type*\n\n{escape_markdown(error_msg)}", parse_mode=ParseMode.MARKDOWN_V2) # Escaped error_msg
                 return
             
             parsed_info = parse_torrent_name(ti.name())
@@ -1497,47 +1488,143 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Edit the message where the selection buttons were to show the confirmation prompt
             await message.edit_text(confirmation_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
             print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Sent confirmation prompt to chat_id {message.chat_id} for torrent '{display_name}'.")
             
-            # Store pending_torrent for final confirmation. This is critical.
+            # Now source_type and source_value are correctly defined here
             context.user_data['pending_torrent'] = {
                 'type': source_type, 
                 'value': source_value, 
                 'clean_name': display_name,
                 'parsed_info': parsed_info,
-                'original_message_id': message.message_id # This message ID is now the one to update for download progress
+                'original_message_id': message.message_id 
             }
-            # --- END OF DUPLICATED LOGIC ---
-
         else:
             print(f"[{ts}] [ERROR] Invalid magnet selection index: {selected_index}")
             await query.edit_message_text("❌ Invalid selection. Please try again or send a new link.")
-        return # Important: exit after handling magnet selection
+        return 
 
-    # --- This is the existing logic for "confirm_download" and "cancel_operation" buttons ---
-    # It must come *after* the `select_magnet_` handling because `select_magnet_` sets `pending_torrent`.
+    # --- 2. Handle Delete Confirmation / Cancellation ---
+    elif query.data == "confirm_delete" or query.data == "cancel_delete_operation":
+        if 'pending_delete_info' not in context.user_data or not context.user_data['pending_delete_info']:
+            print(f"[{ts}] [DELETE] Confirmation ignored: No pending delete info (session expired or invalid).")
+            try:
+                await query.edit_message_text("This deletion request has expired. Please start over with `/delete`.")
+            except BadRequest as e:
+                if "Message is not modified" not in str(e): pass
+            return
+
+        delete_info = context.user_data.pop('pending_delete_info') 
+        
+        if query.data == "confirm_delete":
+            file_path_to_delete = delete_info['path']
+            display_name = delete_info['display_name']
+
+            print(f"[{ts}] [DELETE] User {query.from_user.id} confirmed deletion of: '{file_path_to_delete}'")
+            
+            try:
+                safe_to_delete = False
+                plex_save_paths = context.bot_data["SAVE_PATHS"]
+                allowed_base_paths = [
+                    plex_save_paths.get('movies', ''),
+                    plex_save_paths.get('tv_shows', ''),
+                    plex_save_paths.get('default', '')
+                ]
+                
+                abs_file_path_to_delete = os.path.abspath(file_path_to_delete)
+
+                for base_path in allowed_base_paths:
+                    if base_path: 
+                        abs_base_path = os.path.abspath(base_path)
+                        if abs_file_path_to_delete.startswith(abs_base_path):
+                            safe_to_delete = True
+                            break
+                
+                if not safe_to_delete:
+                    print(f"[{ts}] [DELETE ERROR] Attempted to delete a file outside managed paths: {file_path_to_delete}")
+                    await query.edit_message_text(f"❌ *Deletion Failed:* Attempted to delete a file outside managed paths\\. This is a security precaution\\.", parse_mode=ParseMode.MARKDOWN_V2)
+                    return
+
+                if os.path.exists(file_path_to_delete):
+                    if os.path.isfile(file_path_to_delete):
+                        os.remove(file_path_to_delete)
+                        print(f"[{ts}] [DELETE] Successfully deleted file: {file_path_to_delete}")
+                        parent_dir = os.path.dirname(file_path_to_delete)
+                        if not os.listdir(parent_dir) and os.path.commonpath([abs_file_path_to_delete, parent_dir]) == parent_dir:
+                            os.rmdir(parent_dir)
+                            print(f"[{ts}] [DELETE] Deleted empty directory: {parent_dir}")
+                    elif os.path.isdir(file_path_to_delete): 
+                        shutil.rmtree(file_path_to_delete)
+                        print(f"[{ts}] [DELETE] Successfully deleted directory: {file_path_to_delete}")
+                    
+                    plex_config = context.bot_data.get("PLEX_CONFIG", {})
+                    scan_status_message = ""
+                    if plex_config:
+                        try:
+                            plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
+                            library_name = None
+                            if "Movie:" in display_name:
+                                library_name = 'Movies'
+                            elif "TV Show:" in display_name:
+                                library_name = 'TV Shows'
+                            
+                            if library_name:
+                                target_library = await asyncio.to_thread(plex.library.section, library_name)
+                                await asyncio.to_thread(target_library.update)
+                                scan_status_message = f"\n\nPlex scan for the `{escape_markdown(library_name)}` library has been initiated\\."
+                                print(f"[{ts}] [PLEX] Successfully triggered scan for '{library_name}' library after deletion.")
+                            else:
+                                print(f"[{ts}] [PLEX] Could not infer library type for Plex scan after deletion of '{display_name}'.")
+
+                        except Unauthorized:
+                            print(f"[{ts}] [PLEX ERROR] Plex token is invalid during post-delete scan.")
+                            scan_status_message = "\n\n*Plex Error:* Could not trigger scan due to an invalid token\\."
+                        except NotFound:
+                            print(f"[{ts}] [PLEX ERROR] Plex library not found during post-delete scan.")
+                            scan_status_message = "\n\n*Plex Error:* Library not found for scan\\."
+                        except Exception as e:
+                            print(f"[{ts}] [PLEX ERROR] An unexpected error occurred while connecting to Plex for post-delete scan: {e}")
+                            scan_status_message = "\n\n*Plex Error:* Could not connect to server to trigger scan\\."
+
+                    await query.edit_message_text(
+                        f"✅ *Deletion Successful:*\n\n"
+                        f"`{escape_markdown(display_name)}` has been deleted\\."
+                        f"{scan_status_message}",
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                else:
+                    print(f"[{ts}] [DELETE ERROR] File not found during actual deletion step: {file_path_to_delete}")
+                    await query.edit_message_text(f"❌ *Deletion Failed:* File not found or already deleted: `{escape_markdown(file_path_to_delete)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+            except Exception as e:
+                print(f"[{ts}] [DELETE ERROR] Error during file deletion: {e}")
+                await query.edit_message_text(f"❌ *Deletion Failed:* An error occurred during deletion: `{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+        
+        elif query.data == "cancel_delete_operation":
+            print(f"[{ts}] [DELETE] User {query.from_user.id} cancelled deletion operation.")
+            try:
+                await query.edit_message_text("❌ Deletion cancelled.")
+            except BadRequest as e:
+                if "Message is not modified" not in str(e): pass
+        return 
+
+    # --- 3. Handle Download Confirmation / Cancellation ---
+    # This is the existing logic for "confirm_download" and "cancel_operation" buttons.
+    # It will only be reached if the query.data was NOT a magnet selection or a delete operation.
     
-    # Check if a pending torrent exists for 'confirm_download'/'cancel_operation'
-    # This `if` statement is where the warning in the log originates.
-    # It should pass now that context.user_data is guaranteed to be a dict
-    # and `pending_torrent` is set by the `select_magnet_` block.
     if 'pending_torrent' not in context.user_data: 
-        print(f"[{ts}] [WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired). This implies a missing `pending_torrent` after initial processing.")
+        print(f"[{ts}] [WARN] Button press from user {query.from_user.id} ignored: No pending torrent found (session likely expired).")
         try:
             await query.edit_message_text("This action has expired. Please send the link again.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
         return
 
-    # If pending_torrent *is* in context.user_data, proceed
-    pending_torrent = context.user_data.pop('pending_torrent') # Pop it here so it's cleared for next operation
+    pending_torrent = context.user_data.pop('pending_torrent') 
     
     if query.data == "confirm_download":
         print(f"[{ts}] [SUCCESS] Download confirmed by user {query.from_user.id}. Queuing download task.")
         try:
-            # Edit the message where the confirmation buttons were
             await query.edit_message_text("✅ Confirmation received. Your download has been queued.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): pass
@@ -1558,11 +1645,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         active_downloads = context.bot_data.get('active_downloads', {})
         
-        # Use message_id from pending_torrent, which was the message displaying options/confirmation
         download_data = {
             'source_dict': pending_torrent,
-            'chat_id': message.chat_id, # Use message.chat_id from the query
-            'message_id': pending_torrent['original_message_id'], # Use the stored message ID for status updates
+            'chat_id': message.chat_id, 
+            'message_id': pending_torrent['original_message_id'], 
             'save_path': final_save_path
         }
         
@@ -1578,117 +1664,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Operation cancelled by user.")
         except BadRequest as e:
             if "Message is not modified" not in str(e): raise
-        if pending_torrent.get('type') == 'file' and pending_torrent.get('value') and os.path.exists(pending_torrent.get('value')):
-            os.remove(pending_torrent.get('value'))
-
-    elif query.data == "confirm_delete":
-        if 'pending_delete_info' not in context.user_data or not context.user_data['pending_delete_info']:
-            print(f"[{ts}] [DELETE] Confirmation ignored: No pending delete info (session expired or invalid).")
-            try:
-                await query.edit_message_text("This deletion request has expired. Please start over with `/delete`.")
-            except BadRequest as e:
-                if "Message is not modified" not in str(e): pass # Ignore if message not modified
-            return
-
-        delete_info = context.user_data.pop('pending_delete_info') # Pop to clear the state
-        file_path_to_delete = delete_info['path']
-        display_name = delete_info['display_name']
-
-        print(f"[{ts}] [DELETE] User {query.from_user.id} confirmed deletion of: '{file_path_to_delete}'")
-        
-        try:
-            # --- CRITICAL SAFETY CHECK: Ensure the path is within the allowed save paths ---
-            safe_to_delete = False
-            plex_save_paths = context.bot_data["SAVE_PATHS"]
-            allowed_base_paths = [
-                plex_save_paths.get('movies', ''),
-                plex_save_paths.get('tv_shows', ''),
-                plex_save_paths.get('default', '')
-            ]
-            
-            # Ensure paths are absolute and normalized for reliable comparison
-            abs_file_path_to_delete = os.path.abspath(file_path_to_delete)
-
-            for base_path in allowed_base_paths:
-                if base_path: # Only check if base_path is not empty
-                    abs_base_path = os.path.abspath(base_path)
-                    # Check if the file path starts with the base path and is within it
-                    if abs_file_path_to_delete.startswith(abs_base_path):
-                        safe_to_delete = True
-                        break
-            
-            if not safe_to_delete:
-                print(f"[{ts}] [DELETE ERROR] Attempted to delete a file outside managed paths: {file_path_to_delete}")
-                await query.edit_message_text(f"❌ *Deletion Failed:* Attempted to delete a file outside managed paths\\. This is a security precaution\\.", parse_mode=ParseMode.MARKDOWN_V2)
-                return
-
-            # Perform the actual deletion
-            if os.path.exists(file_path_to_delete):
-                if os.path.isfile(file_path_to_delete):
-                    os.remove(file_path_to_delete)
-                    print(f"[{ts}] [DELETE] Successfully deleted file: {file_path_to_delete}")
-                    # Attempt to clean up parent directories if they become empty
-                    parent_dir = os.path.dirname(file_path_to_delete)
-                    # Check if the parent directory is empty and *also* within managed paths
-                    if not os.listdir(parent_dir) and os.path.commonpath([abs_file_path_to_delete, parent_dir]) == parent_dir:
-                        os.rmdir(parent_dir)
-                        print(f"[{ts}] [DELETE] Deleted empty directory: {parent_dir}")
-                elif os.path.isdir(file_path_to_delete): # If the matched item was a directory (e.g., an entire show/season)
-                    shutil.rmtree(file_path_to_delete)
-                    print(f"[{ts}] [DELETE] Successfully deleted directory: {file_path_to_delete}")
-                
-                # --- Attempt Plex Scan after deletion ---
-                plex_config = context.bot_data.get("PLEX_CONFIG", {})
-                scan_status_message = ""
-                if plex_config:
-                    try:
-                        plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
-                        # Try to determine if it was a movie or TV show to scan specific library
-                        library_name = None
-                        if "Movie:" in display_name:
-                            library_name = 'Movies'
-                        elif "TV Show:" in display_name:
-                            library_name = 'TV Shows'
-                        
-                        if library_name:
-                            target_library = await asyncio.to_thread(plex.library.section, library_name)
-                            await asyncio.to_thread(target_library.update)
-                            scan_status_message = f"\n\nPlex scan for the `{escape_markdown(library_name)}` library has been initiated\\."
-                            print(f"[{ts}] [PLEX] Successfully triggered scan for '{library_name}' library after deletion.")
-                        else:
-                            print(f"[{ts}] [PLEX] Could not infer library type for Plex scan after deletion of '{display_name}'.")
-
-                    except Unauthorized:
-                        print(f"[{ts}] [PLEX ERROR] Plex token is invalid during post-delete scan.")
-                        scan_status_message = "\n\n*Plex Error:* Could not trigger scan due to an invalid token\\."
-                    except NotFound:
-                        print(f"[{ts}] [PLEX ERROR] Plex library not found during post-delete scan.")
-                        scan_status_message = "\n\n*Plex Error:* Library not found for scan\\."
-                    except Exception as e:
-                        print(f"[{ts}] [PLEX ERROR] An unexpected error occurred while connecting to Plex for post-delete scan: {e}")
-                        scan_status_message = "\n\n*Plex Error:* Could not connect to server to trigger scan\\."
-
-                await query.edit_message_text(
-                    f"✅ *Deletion Successful:*\n\n"
-                    f"`{escape_markdown(display_name)}` has been deleted\\."
-                    f"{scan_status_message}",
-                    parse_mode=ParseMode.MARKDOWN_V2
-                )
-            else:
-                print(f"[{ts}] [DELETE ERROR] File not found during actual deletion step: {file_path_to_delete}")
-                await query.edit_message_text(f"❌ *Deletion Failed:* File not found or already deleted: `{escape_markdown(file_path_to_delete)}`", parse_mode=ParseMode.MARKDOWN_V2)
-
-        except Exception as e:
-            print(f"[{ts}] [DELETE ERROR] Error during file deletion: {e}")
-            await query.edit_message_text(f"❌ *Deletion Failed:* An error occurred during deletion: `{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
-    
-    elif query.data == "cancel_delete_operation":
-        context.user_data.pop('pending_delete_info', None) # Clear any pending info
-        print(f"[{ts}] [DELETE] User {query.from_user.id} cancelled deletion operation.")
-        try:
-            await query.edit_message_text("❌ Deletion cancelled.")
-        except BadRequest as e:
-            if "Message is not modified" not in str(e): pass # Ignore if message not modified
 
 async def download_task_wrapper(download_data: Dict, application: Application):
     source_dict = download_data['source_dict']
