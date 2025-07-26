@@ -558,6 +558,20 @@ async def is_user_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     return True
 
+# Define a custom filter class for waiting_for_delete_input
+class WaitingForDeleteInputFilter(filters.BaseFilter):
+    """
+    A filter that returns True if the bot is expecting
+    user input for a delete operation, False otherwise.
+    """
+    def filter(self, update: Update, context: CallbackContext) -> bool:
+        if update.effective_user and context.user_data:
+            return context.user_data.get('waiting_for_delete_input', False)
+        return False
+
+# Create an instance of the custom filter. This instance is what you'll use in MessageHandler.
+waiting_for_delete_input_filter_instance = WaitingForDeleteInputFilter()
+
 # --- PERSISTENCE FUNCTIONS ---
 
 def save_active_downloads(file_path: str, active_downloads: Dict):
@@ -677,7 +691,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Note that special characters like '.', '-', and '!' must be escaped with a '\'.
     help_text = (
         "Here are the available commands:\n\n"
-        "`start` \\- Show welcome message\\.\n"
+        "`hello` \\- Show welcome message\\.\n"
         "`cancel` \\- Stop download\\.\n"
         "`plexstatus` \\- Check Plex\\.\n"
         "`plexrestart` \\- Restart Plex\\.\n"
@@ -785,11 +799,8 @@ async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_input = update.message.text.strip()
     ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # Ensure user_data is initialized and flag is set
-    # This handler must be placed AFTER specific command handlers but BEFORE the general handle_message
-    # in application.add_handler to ensure proper flow.
-    if context.user_data is None or not context.user_data.get('waiting_for_delete_input'):
-        return 
+    if context.user_data is None:
+        context.user_data = {}
 
     # Clear the flag immediately to prevent further inputs being treated as delete titles
     context.user_data.pop('waiting_for_delete_input', None)
@@ -1929,8 +1940,8 @@ if __name__ == '__main__':
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND, # Filter for non-command text
-            handle_delete_input # Removed the invalid 'chat_data=True' parameter
+            filters.TEXT & ~filters.COMMAND & waiting_for_delete_input_filter_instance, # FIX: Use the instantiated filter object
+            handle_delete_input
         )
     )
         

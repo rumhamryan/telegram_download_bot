@@ -4,6 +4,8 @@ ToDo:
 - A cancel button for the multi-magnet selection
 - A cancel button for torrents currently downloading
 - look into deleting entire chat every time to reducing remote logging
+- bug with the display of magnet links, does not refer to the codec
+- latest commit broke torrent downloading interaction, nothing happened after submitting a link
 
 - auto-search, type a movie or tv show, below is the site heirarchy, but there is more tribal knowledge to dump here before implementation
   - movies
