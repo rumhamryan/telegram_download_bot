@@ -721,6 +721,239 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[{ts}] [INFO] Received /cancel command from chat_id {chat_id}, but no active task was found.")
         await update.message.reply_text("ℹ️ There are no active downloads for you to cancel.")
 
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Initiates the media deletion process by prompting the user for the title to delete.
+    """
+    if not await is_user_authorized(update, context):
+        return
+    if not update.message:
+        return
+
+    chat_id = update.message.chat_id
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Ensure user_data is initialized
+    if context.user_data is None:
+        context.user_data = {}
+
+    # Disallow deletion if a download is currently active to prevent conflicts
+    if str(chat_id) in context.bot_data.get('active_downloads', {}):
+        await update.message.reply_text("ℹ️ You have an active download. Please /cancel it first or wait for it to complete before attempting to delete media.")
+        return
+
+    # Set a flag in user_data to indicate the bot is waiting for a delete title
+    context.user_data['waiting_for_delete_input'] = True
+    print(f"[{ts}] [DELETE] User {chat_id} initiated delete command. Waiting for input.")
+    
+    # Escape the example strings for MarkdownV2
+    example_movie = escape_markdown("Movie Title (Year)")
+    example_tv = escape_markdown("TV Show Name S01E01")
+    explanation_tv = escape_markdown("(Season and Episode required for TV shows)")
+
+    await update.message.reply_text(
+        "🗑️ *Delete Media:*\n\n"
+        "Which Movie or TV Show would you like to delete?\n\n"
+        "Please provide the full title, for example:\n"
+        f"`{example_movie}`\n"
+        "or\n"
+        f"`{example_tv}` {explanation_tv}\n\n"
+        # FIX: Escaped the period at the end of the sentence
+        "Send `/cancel` at any point to stop this operation\\.",
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+async def handle_delete_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Processes the user's input for the media title to be deleted,
+    finds potential files, and asks for confirmation.
+    """
+    if not await is_user_authorized(update, context):
+        return
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.message.chat_id
+    user_input = update.message.text.strip()
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Ensure user_data is initialized and flag is set
+    if context.user_data is None or not context.user_data.get('waiting_for_delete_input'):
+        # If not waiting for delete input, this message is not for deletion.
+        # It's crucial this handler is registered BEFORE the generic handle_message.
+        return 
+
+    # Clear the flag immediately to prevent further inputs being treated as delete titles
+    context.user_data.pop('waiting_for_delete_input', None)
+
+    print(f"[{ts}] [DELETE] Processing delete input from {chat_id}: '{user_input}'")
+    
+    processing_message = await update.message.reply_text("🔎 Searching for media to delete...")
+
+    # Use parse_torrent_name logic to guess media type from user input
+    # It will return type='unknown' if it doesn't find SXXEXX or (YEAR)
+    parsed_info = parse_torrent_name(user_input)
+    media_type = parsed_info.get('type', 'unknown')
+    
+    # --- NEW: Provide specific feedback if input format is not recognized ---
+    if media_type == 'unknown':
+        print(f"[{ts}] [DELETE] Input '{user_input}' could not be classified as movie/TV. Prompting user for correct format.")
+        await processing_message.edit_text(
+            f"❓ *Unrecognized Format:*\n\n"
+            f"I couldn't identify '{escape_markdown(user_input)}' as a specific movie or TV show using the expected format\\. "
+            f"Please ensure you include the year for movies (e\\.g\\., `Movie Title \\(2023\\)`) "
+            f"or the season and episode for TV shows (e\\.g\\., `TV Show Name S01E01`)\\.\n\n"
+            f"Send `/cancel` to stop this operation\\.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        # Delete the user's input message for tidiness
+        try:
+            await update.message.delete()
+            print(f"[{ts}] [DELETE] Deleted user's invalid input message for deletion.")
+        except BadRequest as e:
+            if "Message to delete not found" in str(e) or "not enough rights" in str(e):
+                print(f"[{ts}] [WARN] Could not delete user's delete input message. Reason: {e}")
+            else:
+                raise # Re-raise if it's an unexpected BadRequest
+        return # Exit early if input format is not recognized
+
+    potential_files: List[Tuple[str, str]] = [] # List of (display_name, absolute_path)
+    save_paths = context.bot_data["SAVE_PATHS"]
+
+    # --- Search for Movies ---
+    if media_type == 'movie' and 'year' in parsed_info:
+        movie_base_path = save_paths.get('movies', save_paths['default'])
+        search_name = f"{parsed_info['title']} ({parsed_info['year']})"
+        
+        # Sanitize search name to match how Plex-friendly names are generated
+        invalid_chars = r'<>:"/\|?*'
+        safe_search_name = "".join(c for c in search_name if c not in invalid_chars)
+        
+        # Regex to match the start of the filename (e.g., "Movie Title (2023)") and common video extensions
+        # This regex specifically targets files named by the bot's `generate_plex_filename`
+        # which uses "Title (Year).ext"
+        expected_filename_regex = re.compile(rf"^{re.escape(safe_search_name)}\s*\.(mkv|mp4)$", re.IGNORECASE)
+
+        print(f"[{ts}] [DELETE] Searching for movie pattern '{safe_search_name}' in '{movie_base_path}'")
+        for root, _, files in os.walk(movie_base_path):
+            for file in files:
+                if expected_filename_regex.match(file):
+                    full_path = os.path.join(root, file)
+                    potential_files.append((f"Movie: {os.path.splitext(file)[0]}", full_path))
+                    print(f"[{ts}] [DELETE] Found potential movie file: {full_path}")
+                    
+    # --- Search for TV Shows ---
+    elif media_type == 'tv' and 'season' in parsed_info and 'episode' in parsed_info:
+        show_title_raw = parsed_info['title']
+        season_num = parsed_info['season']
+        episode_num = parsed_info['episode']
+
+        # Sanitize show title for path comparison
+        invalid_chars = r'<>:"/\|?*'
+        safe_show_title = "".join(c for c in show_title_raw if c not in invalid_chars)
+        
+        tv_base_path = save_paths.get('tv_shows', save_paths['default'])
+
+        season_padded = f"{season_num:02d}"
+        episode_padded = f"{episode_num:02d}"
+        
+        # Regex to match 'sXXeXX' in the filename and common video extensions
+        episode_file_pattern = re.compile(rf"(?i)s{season_padded}e{episode_padded}.*\.(mkv|mp4)$")
+
+        print(f"[{ts}] [DELETE] Searching for TV show '{safe_show_title}' and episode S{season_padded}E{episode_padded} in '{tv_base_path}'")
+
+        for root, _, files in os.walk(tv_base_path):
+            # Check if the current path contains the show title and a season directory (case-insensitive)
+            # This attempts to match the typical Plex structure: /TV Shows/Show Name/Season XX/
+            path_segments = [s.lower() for s in root.replace('\\', '/').split('/')] # Normalize and lowercase path segments
+            
+            show_title_in_path = False
+            season_dir_in_path = False
+
+            # Check for show title in path segments
+            for segment in path_segments:
+                if safe_show_title.lower() in segment: # Use 'in' for more flexible match
+                    show_title_in_path = True
+                    break
+            
+            # Check for season directory in path segments (e.g., "Season 01", "Season 1")
+            for segment in path_segments:
+                season_match = re.match(r'season\s*(\d{1,2})', segment)
+                if season_match and int(season_match.group(1)) == season_num:
+                    season_dir_in_path = True
+                    break
+
+            if show_title_in_path and season_dir_in_path:
+                for file in files:
+                    if episode_file_pattern.search(file):
+                        full_path = os.path.join(root, file)
+                        # Construct a display name relative to the base path for clarity
+                        try:
+                            # Use relpath for a more user-friendly display of the file location
+                            relative_display_name = os.path.relpath(full_path, tv_base_path)
+                            display_text = os.path.splitext(relative_display_name)[0]
+                        except ValueError: # Path error, e.g. file_path_to_delete not under tv_base_path
+                            display_text = os.path.splitext(os.path.basename(full_path))[0] # Fallback to just filename
+                            
+                        potential_files.append((f"TV Show: {display_text}", full_path))
+                        print(f"[{ts}] [DELETE] Found potential TV episode file: {full_path}")
+
+    # --- Confirmation Step ---
+    if potential_files:
+        # If multiple files are found (e.g., different qualities of the same movie, or multiple episodes if regex was too broad)
+        if len(potential_files) > 1:
+            reply_text = "⚠️ *Multiple potential files found!* Please be more specific with your title.\n\n"
+            for i, (display_name, _) in enumerate(potential_files):
+                reply_text += f"*{i+1}\\.* `{escape_markdown(display_name)}`\n"
+            reply_text += "\n" + escape_markdown("Please try again with a more exact name, or consider manual deletion if unsure.")
+            
+            keyboard = [[
+                InlineKeyboardButton("❌ Cancel Delete", callback_data="cancel_delete_operation"),
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+            # Do not store pending_delete_info if multiple ambiguous matches
+            context.user_data['pending_delete_info'] = None 
+        else:
+            # Only one potential file found, proceed to confirmation
+            display_name, abs_path = potential_files[0]
+            reply_text = (
+                f"🗑️ *Confirm Deletion:*\n\n"
+                f"Are you sure you want to delete this file?\n\n"
+                f"File: `{escape_markdown(display_name)}`\n"
+                f"Path: `{escape_markdown(abs_path)}`\n\n"
+                f"*This action cannot be undone\\!*"
+            )
+            keyboard = [[
+                InlineKeyboardButton("✅ Yes, Delete", callback_data="confirm_delete"),
+                InlineKeyboardButton("❌ No, Cancel", callback_data="cancel_delete_operation"),
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Store the file path and display name for the actual deletion step in button_handler
+            context.user_data['pending_delete_info'] = {'path': abs_path, 'display_name': display_name}
+            await processing_message.edit_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+
+    else: # No files found after parsing input
+        print(f"[{ts}] [DELETE] No media found matching '{user_input}' (after parsing).")
+        await processing_message.edit_text(
+            f"❌ No media found matching `{escape_markdown(user_input)}` in your configured media directories\\.\n\n"
+            f"Please ensure the title is exact and the file is located within the bot's managed paths\\.\n"
+            f"Send `/cancel` to stop this operation\\.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    
+    # Delete the user's initial input message (if not already deleted by the 'unknown' path)
+    if update.message.message_id != processing_message.message_id: # Only delete if it's not the 'processing' message itself
+        try:
+            await update.message.delete()
+            print(f"[{ts}] [DELETE] Deleted user's input message for deletion (final step).")
+        except BadRequest as e:
+            if "Message to delete not found" in str(e) or "not enough rights" in str(e):
+                print(f"[{ts}] [WARN] Could not delete user's delete input message. Reason: {e}")
+            else:
+                raise # Re-raise if it's an unexpected BadRequest
+
 async def plex_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Checks the connection to the Plex Media Server."""
     if not await is_user_authorized(update, context):
@@ -1116,8 +1349,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'original_message_id': progress_message.message_id # Store the ID of the message to be updated
     }
 
-# ... (existing imports) ...
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_authorized(update, context):
         return
@@ -1309,6 +1540,115 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "Message is not modified" not in str(e): raise
         if pending_torrent.get('type') == 'file' and pending_torrent.get('value') and os.path.exists(pending_torrent.get('value')):
             os.remove(pending_torrent.get('value'))
+
+    elif query.data == "confirm_delete":
+        if 'pending_delete_info' not in context.user_data or not context.user_data['pending_delete_info']:
+            print(f"[{ts}] [DELETE] Confirmation ignored: No pending delete info (session expired or invalid).")
+            try:
+                await query.edit_message_text("This deletion request has expired. Please start over with `/delete`.")
+            except BadRequest as e:
+                if "Message is not modified" not in str(e): pass # Ignore if message not modified
+            return
+
+        delete_info = context.user_data.pop('pending_delete_info') # Pop to clear the state
+        file_path_to_delete = delete_info['path']
+        display_name = delete_info['display_name']
+
+        print(f"[{ts}] [DELETE] User {query.from_user.id} confirmed deletion of: '{file_path_to_delete}'")
+        
+        try:
+            # --- CRITICAL SAFETY CHECK: Ensure the path is within the allowed save paths ---
+            safe_to_delete = False
+            plex_save_paths = context.bot_data["SAVE_PATHS"]
+            allowed_base_paths = [
+                plex_save_paths.get('movies', ''),
+                plex_save_paths.get('tv_shows', ''),
+                plex_save_paths.get('default', '')
+            ]
+            
+            # Ensure paths are absolute and normalized for reliable comparison
+            abs_file_path_to_delete = os.path.abspath(file_path_to_delete)
+
+            for base_path in allowed_base_paths:
+                if base_path: # Only check if base_path is not empty
+                    abs_base_path = os.path.abspath(base_path)
+                    # Check if the file path starts with the base path and is within it
+                    if abs_file_path_to_delete.startswith(abs_base_path):
+                        safe_to_delete = True
+                        break
+            
+            if not safe_to_delete:
+                print(f"[{ts}] [DELETE ERROR] Attempted to delete a file outside managed paths: {file_path_to_delete}")
+                await query.edit_message_text(f"❌ *Deletion Failed:* Attempted to delete a file outside managed paths\\. This is a security precaution\\.", parse_mode=ParseMode.MARKDOWN_V2)
+                return
+
+            # Perform the actual deletion
+            if os.path.exists(file_path_to_delete):
+                if os.path.isfile(file_path_to_delete):
+                    os.remove(file_path_to_delete)
+                    print(f"[{ts}] [DELETE] Successfully deleted file: {file_path_to_delete}")
+                    # Attempt to clean up parent directories if they become empty
+                    parent_dir = os.path.dirname(file_path_to_delete)
+                    # Check if the parent directory is empty and *also* within managed paths
+                    if not os.listdir(parent_dir) and os.path.commonpath([abs_file_path_to_delete, parent_dir]) == parent_dir:
+                        os.rmdir(parent_dir)
+                        print(f"[{ts}] [DELETE] Deleted empty directory: {parent_dir}")
+                elif os.path.isdir(file_path_to_delete): # If the matched item was a directory (e.g., an entire show/season)
+                    shutil.rmtree(file_path_to_delete)
+                    print(f"[{ts}] [DELETE] Successfully deleted directory: {file_path_to_delete}")
+                
+                # --- Attempt Plex Scan after deletion ---
+                plex_config = context.bot_data.get("PLEX_CONFIG", {})
+                scan_status_message = ""
+                if plex_config:
+                    try:
+                        plex = await asyncio.to_thread(PlexServer, plex_config['url'], plex_config['token'])
+                        # Try to determine if it was a movie or TV show to scan specific library
+                        library_name = None
+                        if "Movie:" in display_name:
+                            library_name = 'Movies'
+                        elif "TV Show:" in display_name:
+                            library_name = 'TV Shows'
+                        
+                        if library_name:
+                            target_library = await asyncio.to_thread(plex.library.section, library_name)
+                            await asyncio.to_thread(target_library.update)
+                            scan_status_message = f"\n\nPlex scan for the `{escape_markdown(library_name)}` library has been initiated\\."
+                            print(f"[{ts}] [PLEX] Successfully triggered scan for '{library_name}' library after deletion.")
+                        else:
+                            print(f"[{ts}] [PLEX] Could not infer library type for Plex scan after deletion of '{display_name}'.")
+
+                    except Unauthorized:
+                        print(f"[{ts}] [PLEX ERROR] Plex token is invalid during post-delete scan.")
+                        scan_status_message = "\n\n*Plex Error:* Could not trigger scan due to an invalid token\\."
+                    except NotFound:
+                        print(f"[{ts}] [PLEX ERROR] Plex library not found during post-delete scan.")
+                        scan_status_message = "\n\n*Plex Error:* Library not found for scan\\."
+                    except Exception as e:
+                        print(f"[{ts}] [PLEX ERROR] An unexpected error occurred while connecting to Plex for post-delete scan: {e}")
+                        scan_status_message = "\n\n*Plex Error:* Could not connect to server to trigger scan\\."
+
+                await query.edit_message_text(
+                    f"✅ *Deletion Successful:*\n\n"
+                    f"`{escape_markdown(display_name)}` has been deleted\\."
+                    f"{scan_status_message}",
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+            else:
+                print(f"[{ts}] [DELETE ERROR] File not found during actual deletion step: {file_path_to_delete}")
+                await query.edit_message_text(f"❌ *Deletion Failed:* File not found or already deleted: `{escape_markdown(file_path_to_delete)}`", parse_mode=ParseMode.MARKDOWN_V2)
+
+        except Exception as e:
+            print(f"[{ts}] [DELETE ERROR] Error during file deletion: {e}")
+            await query.edit_message_text(f"❌ *Deletion Failed:* An error occurred during deletion: `{escape_markdown(str(e))}`", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    elif query.data == "cancel_delete_operation":
+        context.user_data.pop('pending_delete_info', None) # Clear any pending info
+        print(f"[{ts}] [DELETE] User {query.from_user.id} cancelled deletion operation.")
+        try:
+            await query.edit_message_text("❌ Deletion cancelled.")
+        except BadRequest as e:
+            if "Message is not modified" not in str(e): pass # Ignore if message not modified
 
 async def download_task_wrapper(download_data: Dict, application: Application):
     source_dict = download_data['source_dict']
@@ -1567,8 +1907,16 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?start$', re.IGNORECASE)), start_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?help$', re.IGNORECASE)), help_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?cancel$', re.IGNORECASE)), cancel_command))
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?delete$', re.IGNORECASE)), delete_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?plexstatus$', re.IGNORECASE)), plex_status_command))
     application.add_handler(MessageHandler(filters.Regex(re.compile(r'^/?plexrestart$', re.IGNORECASE)), plex_restart_command))
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, # Filter for non-command text
+            handle_delete_input # Removed the invalid 'chat_data=True' parameter
+        )
+    )
         
     # This generic handler for links/magnets now correctly comes after the specific command
     # handlers and will not be triggered by command words.
