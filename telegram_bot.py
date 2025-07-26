@@ -677,10 +677,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Note that special characters like '.', '-', and '!' must be escaped with a '\'.
     help_text = (
         "Here are the available commands:\n\n"
-        "`start` \- Show welcome message\.\n"
-        "`cancel` \- Stop download\.\n"
-        "`plexstatus` \- Check Plex\.\n"
-        "`plexrestart` \- Restart Plex\.\n\n"
+        "`start` \\- Show welcome message\\.\n"
+        "`cancel` \\- Stop download\\.\n"
+        "`plexstatus` \\- Check Plex\\.\n"
+        "`plexrestart` \\- Restart Plex\\.\n"
+        "`delete` \\- Delete media files\\.\n\n" # Added the new command and escaped characters
     )
     
     await update.message.reply_text(
