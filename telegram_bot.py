@@ -558,16 +558,23 @@ async def is_user_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     return True
 
-# Define a custom filter class for waiting_for_delete_input
 class WaitingForDeleteInputFilter(filters.BaseFilter):
     """
     A filter that returns True if the bot is expecting
     user input for a delete operation, False otherwise.
     """
     def filter(self, update: Update, context: CallbackContext) -> bool:
-        if update.effective_user and context.user_data:
-            return context.user_data.get('waiting_for_delete_input', False)
-        return False
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        is_waiting = False
+        user_id = "N/A"
+        if update.effective_user:
+            user_id = update.effective_user.id
+        
+        if context.user_data:
+            is_waiting = context.user_data.get('waiting_for_delete_input', False)
+        
+        print(f"[{ts}] [FILTER DEBUG] WaitingForDeleteInputFilter for User {user_id}: 'waiting_for_delete_input' is {is_waiting}")
+        return is_waiting
 
 # Create an instance of the custom filter. This instance is what you'll use in MessageHandler.
 waiting_for_delete_input_filter_instance = WaitingForDeleteInputFilter()
@@ -1154,21 +1161,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Handles incoming messages, processing magnet links, .torrent files,
     or web pages containing magnet links.
     """
+    ts_start = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] handle_message entered for chat_id {update.message.chat_id if update.message else 'N/A'}") # Added null check
+
     if not await is_user_authorized(update, context):
+        print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] User not authorized. Exiting handle_message.")
         return
         
-    if not update.message or not update.message.text: return
+    if not update.message or not update.message.text: 
+        print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] No message or text. Exiting handle_message.")
+        return
+    
     chat_id = update.message.chat_id
     text = update.message.text.strip()
     user_message_to_delete = update.message # Reference to the original message for deletion
 
     # --- FIX: Ensure context.user_data is a dictionary ---
     if context.user_data is None:
-        context.user_data = {} # Initialize if it's None to prevent "Object of type 'None' is not subscriptable"
+        context.user_data = {}
         print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARN] context.user_data was None and has been initialized.")
 
     # Check if user already has an active download
     if str(chat_id) in context.bot_data.get('active_downloads', {}):
+        print(f"[{ts_start}] [HANDLE MESSAGE DEBUG] Active download exists. Sending message.")
         await update.message.reply_text("ℹ️ You already have a download in progress. Please /cancel it before starting a new one.")
         return
 
